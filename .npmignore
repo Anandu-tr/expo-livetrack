@@ -13,3 +13,6 @@ __tests__
 /android/src/test/
 /android/build/
 /example/
+
+# Dev-only dummy ingestion server for isolated validation; never published.
+/test-server/
