@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["LiveTrackModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.livetrack.LiveTrackModule"]
+  }
+}
