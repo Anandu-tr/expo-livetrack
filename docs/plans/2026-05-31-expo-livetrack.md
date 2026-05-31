@@ -252,25 +252,25 @@ test('throws if iOS purpose strings missing', () => {
 
 ---
 
-## Phase 8 — Backend ingestion endpoint (full TDD, in sim_admin)
+## Phase 8 — Dummy ingestion test server (IN-PACKAGE, NOT sim_admin)
 
-> NOTE: This is the one task that touches `sim_admin/backend`. Confirm with the user before modifying that repo (original STRICT_RULE was scoped to the RCA).
+> **Decision:** Do NOT modify `sim_admin`. For validation, build a self-contained mock ingestion server **inside the tracker repo** (`test-server/`) that mirrors the real `/locations/batch` contract. This lets us run + curl the endpoint and validate the capture→buffer→upload→ACK flow in total isolation. The real production endpoint in `sim_admin` is a separate, later effort the team owns.
 
-### Task 8.1: POST /locations/batch
-**Files:** Create `backend/src/modules/location/ingest/ingest.dto.ts`, `ingest.service.ts`, `ingest.controller.ts`; Test `ingest.service.spec.ts`
-- [ ] **Step 1: Failing service test** (Jest): given a batch with one `acc=80` point, one `acc=12` point, and a duplicate `(u,t)`, assert only the valid, de-duplicated point is written and accepted-ids returned; mock the Firebase ref `.update`.
+### Task 8.1: Dummy `/locations/batch` server + contract tests (full TDD)
+**Files:** Create `test-server/server.ts` (or `.js`), `test-server/ingest.ts` (validate/dedupe logic), `test-server/package.json`; Test `test-server/__tests__/ingest.test.ts`
+- [ ] **Step 1: Failing test** (Jest+supertest): POST a batch with one `acc=80` point, one `acc=12` point, a duplicate `(u,t)`, and one event row → assert response 200 with `acceptedIds` containing only the valid+deduped point ids (and the event), and that an in-memory store now holds exactly those records. Missing/invalid `Authorization` → 401.
 - [ ] **Step 2: Run, verify FAIL.**
-- [ ] **Step 3: Implement** — `ingest.service`: validate (drop `acc>50`), tag `mock`, dedupe by `(u,t)`, build a multi-path `raw_locations/<pushId>` update in the SAME shape the consumer expects, write once, return accepted client ids. `ingest.controller`: `@Post('locations/batch')` guarded by the existing JWT guard, extracts `userId` from token. `ingest.dto`: `class-validator` on points/events arrays.
+- [ ] **Step 3: Implement** — tiny Express server: `POST /locations/batch` (Bearer-token check, any non-empty token accepted for the dummy), body `{points[], events[]}`; `ingest.ts` validates (drop `acc>50`), tags `mock`, dedupes by `(u,t)`, stores in memory, returns `{ acceptedIds }`. Add `GET /debug/received` to inspect everything received (for manual curl validation), and `POST /debug/reset`. Same response contract the native uploader expects (delete-on-ACK by returned ids).
 - [ ] **Step 4: Run, verify PASS.**
-- [ ] **Step 5: Lock down RTDB rules** — change `raw_locations` `.write` from `true` to `false` (writes now go through the authenticated backend). Verify the consumer (admin SDK) still writes/reads.
-- [ ] **Step 6: Commit** `git commit -am "feat(backend): authenticated /locations/batch ingestion + lock RTDB writes"`
+- [ ] **Step 5: Manual validation** — start the server (`npm --prefix test-server start`), `curl` a sample batch, confirm `acceptedIds` + `GET /debug/received` reflect the dedupe/accuracy filtering. Capture the curl output.
+- [ ] **Step 6: Commit** `git commit -am "feat(test-server): dummy /locations/batch for isolated validation"`
 
 ---
 
 ## Phase 9 — Example app + release
 
 ### Task 9.1: End-to-end demo + docs
-- [ ] **Step 1:** In `example/`, a screen: login stub → prominent-disclosure modal → `requestPermissions()` → `ensureNotKilled()` → `start({url, token, userId})`; live `getState()` + `onEvent` log. Point `url` at a running backend `/locations/batch`. **Demonstrate the app-controlled enable-location popup:** subscribe to `onEvent` and, on `LOCATION_OFF`, show an *app-defined* `Alert`/modal (copy + styling owned by the example app, not the package) whose CTA calls `LiveTracker.requestEnableLocation()`. This proves the popup is fully configurable from app code.
+- [ ] **Step 1:** In `example/`, a screen: login stub → prominent-disclosure modal → `requestPermissions()` → `ensureNotKilled()` → `start({url, token, userId})`; live `getState()` + `onEvent` log. Point `url` at the in-package **`test-server`** `/locations/batch` (e.g. `http://<LAN-ip>:8787/locations/batch`) — NOT sim_admin. Use `GET /debug/received` on the test-server to confirm the device's points/events arrived. **Demonstrate the app-controlled enable-location popup:** subscribe to `onEvent` and, on `LOCATION_OFF`, show an *app-defined* `Alert`/modal (copy + styling owned by the example app, not the package) whose CTA calls `LiveTracker.requestEnableLocation()`. This proves the popup is fully configurable from app code.
 - [ ] **Step 2: FULL E2E REAL-DEVICE GATE (Definition of Done):** on 3+ OEM handsets + iPhone, 8-hour ride with swipe-kill + reboot mid-ride → backend receives a continuous track with < 2% point loss; all Tier-2 events delivered with last-known location; offline segment loses zero points.
 - [ ] **Step 3:** Write `README.md` (install, plugin config with purpose strings, API) + compliance docs (disclosure copy, FGS justification text, demo-video script, data-collection field list).
 - [ ] **Step 4: CI** — GitHub Actions: lint + jest + `expo prebuild` Android & iOS build.
