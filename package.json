@@ -26,9 +26,12 @@
   "author": "Anandu <cto.claude@mileseducation.com> ()",
   "license": "MIT",
   "homepage": "#readme",
-  "dependencies": {},
+  "dependencies": {
+    "@expo/config-plugins": "^56.0.0"
+  },
   "devDependencies": {
     "@babel/core": "^7.26.0",
+    "@expo/config-types": "^56.0.0",
     "@types/jest": "^29.2.1",
     "@types/react": "~19.1.1",
     "babel-preset-expo": "~55.0.8",
