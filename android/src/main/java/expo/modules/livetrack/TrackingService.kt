@@ -249,6 +249,14 @@ class TrackingService : Service() {
   }
 
   private fun handleLocation(loc: Location) {
+    // On-device accuracy gate: drop poor fixes at the source. The server also
+    // rejects acc > maxAccuracyM, so buffering them would make rows that are
+    // never ACKed and thus re-sent forever (unbounded buffer growth). Points
+    // with no accuracy reported are kept (downstream jitter fallback handles them).
+    if (loc.hasAccuracy() && loc.accuracy.toDouble() > maxAccuracyM) {
+      return
+    }
+
     lastLat = loc.latitude
     lastLng = loc.longitude
 
