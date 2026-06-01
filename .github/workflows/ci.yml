@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    name: typecheck + jest (package, plugin, test-server)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install package dependencies
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Test — package src (jest)
+        run: npx jest
+
+      - name: Test — config plugin (jest)
+        # GitHub Actions sets CI=true automatically; we also pass CI=1 explicitly
+        # so the run matches the documented local command.
+        run: CI=1 npx jest --rootDir plugin --config plugin/jest.config.js
+
+      - name: Test — dummy ingest server (jest)
+        run: |
+          cd test-server
+          npm ci
+          npx jest
+
+  # TODO: add android/ios build + on-device E2E once native is QA'd.
+  #
+  # Intentionally NOT run today: the native Android/iOS code is implemented but
+  # unverified, and a full Gradle/Xcode build is heavy and would not yet pass.
+  # When the native layer has been QA'd on real hardware, add jobs here for:
+  #   - Android: `npx expo prebuild -p android` + `./gradlew assembleDebug`
+  #   - iOS:     `npx expo prebuild -p ios` + `xcodebuild` (macOS runner)
+  #   - on-device E2E (e.g. Detox / Maestro) against the dummy test-server.
