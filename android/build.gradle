@@ -3,6 +3,13 @@ plugins {
   id 'expo-module-gradle-plugin'
 }
 
+// kapt is used (instead of KSP) for the Room annotation processor: kapt needs no
+// explicit version pin, whereas KSP must be pinned to a version that matches the
+// exact Kotlin version managed by `expo-module-gradle-plugin` — which we cannot
+// verify in this environment. // VERIFY: if the project standardizes on KSP,
+// swap `kotlin-kapt` for the KSP plugin + a Kotlin-aligned KSP version.
+apply plugin: 'kotlin-kapt'
+
 group = 'expo.modules.livetrack'
 version = '0.1.0'
 
@@ -15,4 +22,35 @@ android {
   lintOptions {
     abortOnError false
   }
+  testOptions {
+    unitTests {
+      includeAndroidResources = true
+    }
+  }
+}
+
+dependencies {
+  // FusedLocationProviderClient + ActivityRecognitionClient both live here.
+  // VERIFY: 21.3.0 is the current stable play-services-location at time of writing.
+  implementation "com.google.android.gms:play-services-location:21.3.0"
+
+  // Room persistence (buffer). // VERIFY: 2.6.1 is current stable Room.
+  implementation "androidx.room:room-runtime:2.6.1"
+  implementation "androidx.room:room-ktx:2.6.1"
+  kapt "androidx.room:room-compiler:2.6.1"
+
+  // WorkManager — dep added so the future uploader worker has a home; not wired
+  // in this slice. // VERIFY: 2.9.1 is current stable WorkManager.
+  implementation "androidx.work:work-runtime-ktx:2.9.1"
+
+  // Kotlin coroutines for off-main-thread DB/IO. // VERIFY: 1.8.1 current stable.
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+
+  // --- Unit test (Robolectric + in-memory Room). Requires a gradle host to run. ---
+  // VERIFY: all test dependency versions below.
+  testImplementation "org.robolectric:robolectric:4.12.2"
+  testImplementation "androidx.test:core:1.6.1"
+  testImplementation "androidx.room:room-testing:2.6.1"
+  testImplementation "junit:junit:4.13.2"
+  testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1"
 }
