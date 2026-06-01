@@ -5,16 +5,26 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
+import com.google.android.gms.common.api.ResolvableApiException
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationSettingsRequest
+import com.google.android.gms.location.Priority
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.livetrack.buffer.BufferDb
+import expo.modules.livetrack.buffer.PointEntity
+import expo.modules.livetrack.keepalive.Watchdog
+import expo.modules.livetrack.sync.UploadWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -67,8 +77,10 @@ class LiveTrackModule : Module() {
       val movingDistanceM = numDouble(cadence["movingDistanceM"], 30.0).toFloat()
       val stillIntervalMs = numLong(cadence["stillIntervalMs"], 120_000L)
       val maxAccuracyM = numDouble(cadence["maxAccuracyM"], 50.0)
+      val batchSize = numLong(cadence["batchSize"], 50L).toInt()
 
-      // Persist for the (future) uploader + reboot re-arm.
+      // Persist for the uploader + reboot re-arm. wasTracking lets BootReceiver
+      // / Watchdog know whether to resume after a reboot or process death.
       context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
         putString("url", url)
         putString("token", token)
@@ -77,6 +89,8 @@ class LiveTrackModule : Module() {
         putFloat("movingDistanceM", movingDistanceM)
         putLong("stillIntervalMs", stillIntervalMs)
         putFloat("maxAccuracyM", maxAccuracyM.toFloat())
+        putInt("batchSize", batchSize)
+        putBoolean(Prefs.KEY_WAS_TRACKING, true)
         apply()
       }
 
@@ -90,10 +104,21 @@ class LiveTrackModule : Module() {
         putExtra(TrackingService.EXTRA_MAX_ACCURACY_M, maxAccuracyM)
       }
       ContextCompat.startForegroundService(context, intent)
+
+      // Keep-alive + safety-net flush; both unique+KEEP so this is idempotent.
+      runCatching { Watchdog.schedule(context) }
+      runCatching { UploadWorker.enqueuePeriodic(context) }
+
+      // Record a permission-delta event (PERMISSION_GRANTED/REVOKED) vs last seen.
+      scope.launch { runCatching { checkPermissionDelta(context) } }
     }
 
-    // stop(): stop the foreground service.
+    // stop(): stop the foreground service and tear down keep-alive.
     Function("stop") {
+      context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        .putBoolean(Prefs.KEY_WAS_TRACKING, false).apply()
+      runCatching { Watchdog.cancel(context) }
+      runCatching { UploadWorker.cancelPeriodic(context) }
       context.stopService(Intent(context, TrackingService::class.java))
     }
 
@@ -102,6 +127,9 @@ class LiveTrackModule : Module() {
       scope.launch {
         runCatching {
           val ctx = context
+          // Cheap periodic detection: if battery optimization got re-enabled
+          // since last check, buffer a BATTERY_OPT_ON event row.
+          checkBatteryOptDelta(ctx)
           val bufferedCount = BufferDb.getInstance(ctx).pointDao().count()
           val state = Bundle().apply {
             putBoolean("tracking", TrackingService.isRunning)
@@ -170,24 +198,89 @@ class LiveTrackModule : Module() {
       )
     }
 
-    // --- Stubs: implemented in the next task -----------------------------
-
+    // ensureNotKilled(): ask the OS to exempt us from battery optimization so the
+    // foreground service isn't killed in Doze/standby. The package shows NO popup
+    // of its own — this only fires the OS dialog when the host app calls it. OEM
+    // autostart deep-links are handled on the JS side via expo-intent-launcher.
     AsyncFunction("ensureNotKilled") { promise: Promise ->
-      // TODO next task: open battery-optimization-ignore intent / verify service alive.
-      promise.reject(
-        "ERR_NOT_IMPLEMENTED",
-        "ensureNotKilled() is implemented in the next task (battery-opt intent).",
-        null,
-      )
+      runCatching {
+        val ctx = context
+        if (isBatteryOptIgnored(ctx)) {
+          // Already exempt — nothing to ask.
+          promise.resolve(null)
+          return@runCatching
+        }
+        // VERIFY: appContext.currentActivity nullable getter on this expo-modules-core.
+        val activity = appContext.currentActivity
+        // ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS must target a package and
+        // requires the REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission (declared
+        // in this module's AndroidManifest.xml; Play policy restricts its use to
+        // apps with a qualifying background need — location tracking qualifies).
+        // VERIFY: launching this from a non-Activity context needs FLAG_ACTIVITY_NEW_TASK.
+        val intent = Intent(
+          Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+          Uri.parse("package:${ctx.packageName}"),
+        )
+        if (activity != null) {
+          activity.startActivity(intent)
+        } else {
+          intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          ctx.startActivity(intent)
+        }
+        // We can't await the dialog result here (no result contract); resolve once
+        // launched. The host re-reads getState().batteryOptIgnored afterwards.
+        promise.resolve(null)
+      }.onFailure { promise.reject("ERR_ENSURE_NOT_KILLED", it.message, it) }
     }
 
+    // requestEnableLocation(): check location settings; on a resolvable failure,
+    // launch the OS "turn on location" dialog via the current Activity and
+    // resolve true/false from whether services end up enabled. No self-popup.
     AsyncFunction("requestEnableLocation") { promise: Promise ->
-      // TODO next task: SettingsClient.checkLocationSettings + ResolvableApiException UI.
-      promise.reject(
-        "ERR_NOT_IMPLEMENTED",
-        "requestEnableLocation() is implemented in the next task (SettingsClient).",
-        null,
-      )
+      runCatching {
+        val ctx = context
+        if (isLocationEnabled(ctx)) {
+          promise.resolve(true)
+          return@runCatching
+        }
+
+        // VERIFY (whole block): LocationServices.getSettingsClient + LocationRequest
+        // .Builder + ResolvableApiException.startResolutionForResult against the
+        // pinned play-services-location 21.x.
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10_000L).build()
+        val settingsRequest = LocationSettingsRequest.Builder()
+          .addLocationRequest(request)
+          .build()
+
+        val client = LocationServices.getSettingsClient(ctx)
+        client.checkLocationSettings(settingsRequest)
+          .addOnSuccessListener {
+            // Settings already satisfy the request.
+            promise.resolve(true)
+          }
+          .addOnFailureListener { ex ->
+            val activity = appContext.currentActivity
+            if (ex is ResolvableApiException && activity != null) {
+              try {
+                // VERIFY: Expo activity-result plumbing. We don't have a registered
+                // result contract here, so we launch the resolution and then resolve
+                // from a settings re-check rather than the (unavailable) result code.
+                // A cleaner impl would use appContext.registerForActivityResult /
+                // AppContextActivityResultCaller — API surface differs across
+                // expo-modules-core versions and cannot be confirmed in this env.
+                ex.startResolutionForResult(activity, REQ_ENABLE_LOCATION)
+                // Best-effort: resolve from current state. The host should re-read
+                // getState() / listen for the LOCATION_ON event for the truth.
+                promise.resolve(isLocationEnabled(ctx))
+              } catch (e: Exception) {
+                promise.resolve(false)
+              }
+            } else {
+              // Not resolvable (e.g. location mode hard-off) or no activity.
+              promise.resolve(false)
+            }
+          }
+      }.onFailure { promise.reject("ERR_REQUEST_ENABLE_LOCATION", it.message, it) }
     }
   }
 
@@ -229,6 +322,54 @@ class LiveTrackModule : Module() {
     }
   }
 
+  /**
+   * Compare current location-permission grant to the last-seen value and buffer
+   * a PERMISSION_GRANTED / PERMISSION_REVOKED event row on a change. Runs on IO.
+   */
+  private fun checkPermissionDelta(ctx: Context) {
+    val granted = permissionState(ctx) == "granted"
+    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    val hadValue = prefs.contains(Prefs.KEY_LAST_PERMISSION_GRANTED)
+    val last = prefs.getBoolean(Prefs.KEY_LAST_PERMISSION_GRANTED, granted)
+    prefs.edit().putBoolean(Prefs.KEY_LAST_PERMISSION_GRANTED, granted).apply()
+    if (hadValue && last != granted) {
+      bufferEvent(ctx, if (granted) "PERMISSION_GRANTED" else "PERMISSION_REVOKED")
+    }
+  }
+
+  /**
+   * If battery optimization got re-enabled since the last check, buffer a
+   * BATTERY_OPT_ON event row (kept simple; driven from getState()).
+   */
+  private fun checkBatteryOptDelta(ctx: Context) {
+    val ignored = isBatteryOptIgnored(ctx)
+    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    val hadValue = prefs.contains(Prefs.KEY_LAST_BATTERY_OPT_IGNORED)
+    val last = prefs.getBoolean(Prefs.KEY_LAST_BATTERY_OPT_IGNORED, ignored)
+    prefs.edit().putBoolean(Prefs.KEY_LAST_BATTERY_OPT_IGNORED, ignored).apply()
+    // Transition from exempt -> optimized again is the noteworthy event.
+    if (hadValue && last && !ignored) {
+      bufferEvent(ctx, "BATTERY_OPT_ON")
+    }
+  }
+
+  /** Insert a tier-2 event row + emit onEvent (best-effort). Caller is on IO. */
+  private fun bufferEvent(ctx: Context, eventType: String) {
+    val userId = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+      .getString(Prefs.KEY_USER_ID, "") ?: ""
+    val now = System.currentTimeMillis()
+    runCatching {
+      BufferDb.getInstance(ctx).pointDao().insert(
+        PointEntity(userId = userId, t = now, eventType = eventType),
+      )
+    }
+    val payload = Bundle().apply {
+      putString("e", eventType)
+      putDouble("t", now.toDouble())
+    }
+    runCatching { LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_EVENT, payload) }
+  }
+
   private fun numLong(v: Any?, default: Long): Long = when (v) {
     is Number -> v.toLong()
     is String -> v.toLongOrNull() ?: default
@@ -243,5 +384,6 @@ class LiveTrackModule : Module() {
 
   companion object {
     private const val PREFS = "livetrack_prefs"
+    private const val REQ_ENABLE_LOCATION = 3003
   }
 }

@@ -1,2 +1,17 @@
-<manifest>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!--
+    Permissions the config plugin does NOT add but this layer needs. They merge
+    into the host app manifest at build time.
+      - REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: ensureNotKilled() fires
+        ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS. Google Play restricts this
+        permission to apps with a qualifying background use case (continuous
+        location tracking qualifies); the host app's listing must justify it.
+      - SCHEDULE_EXACT_ALARM / USE_EXACT_ALARM: Watchdog uses
+        setExactAndAllowWhileIdle on Android 12+ (gated by canScheduleExactAlarms;
+        falls back to inexact otherwise).
+    VERIFY: confirm these are acceptable for the host app's Play listing.
+  -->
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+  <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+  <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 </manifest>

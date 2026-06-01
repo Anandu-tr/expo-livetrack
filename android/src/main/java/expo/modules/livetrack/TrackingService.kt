@@ -78,6 +78,10 @@ class TrackingService : Service() {
 
   private var activityPendingIntent: PendingIntent? = null
 
+  // Runtime-registered so PROVIDERS_CHANGED is reliably delivered while we're
+  // alive (manifest delivery of this implicit broadcast is often suppressed).
+  private var providerReceiver: expo.modules.livetrack.ProviderReceiver? = null
+
   private val locationCallback = object : LocationCallback() {
     override fun onLocationResult(result: LocationResult) {
       for (loc in result.locations) {
@@ -119,8 +123,8 @@ class TrackingService : Service() {
 
     startLocationUpdates()
     requestActivityUpdates()
+    registerProviderReceiver()
 
-    // TODO next task: schedule/enqueue the upload WorkManager worker here.
     return START_STICKY
   }
 
@@ -128,8 +132,21 @@ class TrackingService : Service() {
     isRunning = false
     runCatching { fused.removeLocationUpdates(locationCallback) }
     removeActivityUpdates()
+    unregisterProviderReceiver()
     scope.cancel()
     super.onDestroy()
+  }
+
+  private fun registerProviderReceiver() {
+    if (providerReceiver != null) return
+    providerReceiver = runCatching {
+      expo.modules.livetrack.ProviderReceiver.register(applicationContext)
+    }.getOrNull()
+  }
+
+  private fun unregisterProviderReceiver() {
+    providerReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+    providerReceiver = null
   }
 
   // --- Config -------------------------------------------------------------
@@ -254,6 +271,9 @@ class TrackingService : Service() {
     )
 
     scope.launch { dao.insert(point) }
+
+    // Nudge the uploader after buffering a fix (unique+KEEP, so cheap to repeat).
+    expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext)
 
     // Best-effort UI emission (short-key shape from LiveTrack.types.ts).
     LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_LOCATION, locationBundle(point))
@@ -441,6 +461,7 @@ class TrackingService : Service() {
       eventType = "HEARTBEAT",
     )
     scope.launch { dao.insert(row) }
+    expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext)
     LiveTrackEventBus.emit(
       LiveTrackEventBus.EVENT_EVENT,
       eventBundle("HEARTBEAT", now, lastLat, lastLng, readBattery().first),
