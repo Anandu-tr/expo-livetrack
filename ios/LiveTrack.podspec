@@ -1,8 +1,8 @@
 Pod::Spec.new do |s|
   s.name           = 'LiveTrack'
   s.version        = '1.0.0'
-  s.summary        = 'A sample project summary'
-  s.description    = 'A sample project description'
+  s.summary        = 'Reliable background location tracker (LiveTrack)'
+  s.description    = 'CLLocationManager capture + durable SQLite buffer + batched uploader.'
   s.author         = ''
   s.homepage       = 'https://docs.expo.dev/modules/'
   s.platforms      = {
