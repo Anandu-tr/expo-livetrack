@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb pull *)",
+      "Bash(adb reverse *)",
+      "Bash(sqlite3 /tmp/livetrack_buffer.db 'SELECT COUNT\\(*\\) AS total FROM points;')",
+      "Bash(sqlite3 -header -column /tmp/livetrack_buffer.db 'SELECT id, u, l, g, t, acc, mock, synced FROM points ORDER BY t DESC LIMIT 5;')",
+      "Bash(sqlite3 /tmp/livetrack_buffer.db 'PRAGMA wal_checkpoint\\(TRUNCATE\\);')",
+      "Bash(sqlite3 /tmp/livetrack_buffer.db 'SELECT COUNT\\(*\\) FROM points;')",
+      "Bash(sqlite3 /tmp/livetrack_buffer.db '.schema points')",
+      "Bash(sqlite3 -header -column /tmp/livetrack_buffer.db 'SELECT id, u, ROUND\\(l,5\\) AS lat, ROUND\\(g,5\\) AS lng, t, acc, mock FROM points ORDER BY t DESC LIMIT 5;')",
+      "Bash(chmod +x /tmp/check-buffer.sh)",
+      "Bash(npm start *)",
+      "Bash(echo \"Server status: $\\(curl -s -H 'Authorization: Bearer dev' http://localhost:8787/debug/received)",
+      "Bash(python3 -c 'import sys,json;d=json.load\\(sys.stdin\\);print\\(len\\(d[\"points\"]\\),\"points on server\"\\)')",
+      "Bash(lsof -iTCP:8787 -sTCP:LISTEN -P -n)",
+      "Bash(python3 -c 'import sys,json;d=json.load\\(sys.stdin\\);print\\(\"Server points:\",len\\(d[\"points\"]\\),\"events:\",len\\(d.get\\(\"events\",[]\\)\\)\\)')",
+      "Bash(bash /tmp/check-buffer.sh)",
+      "Bash(echo \"Before: battery-opt-ignored = $\\(adb shell dumpsys deviceidle whitelist)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3)",
+      "Bash(adb emu *)"
+    ]
+  }
+}

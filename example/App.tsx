@@ -8,7 +8,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
-  Button,
+  Pressable,
   Modal,
   SafeAreaView,
   ScrollView,
@@ -28,7 +28,37 @@ import {
  *   npm --prefix test-server start
  * It listens on port 8787 and accepts any non-empty Bearer token.
  */
-const TRACK_URL = 'http://<YOUR-LAN-IP>:8787/locations/batch';
+const TRACK_URL = 'http://10.0.2.2:8787/locations/batch';
+
+// Local Button (Pressable-based). RN's built-in <Button> doesn't dispatch
+// onPress reliably on the New Architecture (Fabric) in some RN 0.81 builds;
+// Pressable is the official replacement.
+function Button({
+  title,
+  onPress,
+  color,
+}: {
+  title: string;
+  onPress: () => void;
+  color?: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        {
+          backgroundColor: color ?? '#2196F3',
+          opacity: pressed ? 0.7 : 1,
+          paddingVertical: 10,
+          paddingHorizontal: 16,
+          borderRadius: 4,
+          alignItems: 'center',
+        },
+      ]}>
+      <Text style={{ color: 'white', fontWeight: '600', textTransform: 'uppercase' }}>{title}</Text>
+    </Pressable>
+  );
+}
 
 export default function App() {
   const [state, setState] = useState<TrackerState | null>(null);

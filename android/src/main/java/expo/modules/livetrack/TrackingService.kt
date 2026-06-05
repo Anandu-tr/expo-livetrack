@@ -373,7 +373,7 @@ class TrackingService : Service() {
   private fun transition(activity: Int, type: Int): ActivityTransition =
     ActivityTransition.Builder()
       .setActivityType(activity)
-      .setActivityTransitionType(type)
+      .setActivityTransition(type)
       .build()
 
   private fun requestActivityUpdates() {

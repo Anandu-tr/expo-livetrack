@@ -66,7 +66,9 @@ class LiveTrackModule : Module() {
     }
 
     // start(config): persist config + launch the foreground service.
-    Function("start") { config: Map<String, Any?> ->
+    // AsyncFunction because the TS surface declares `start(): Promise<void>` —
+    // a sync Function here returns `undefined` to JS and `.catch` chains crash.
+    AsyncFunction("start") { config: Map<String, Any?>, promise: Promise ->
       val url = config["url"] as? String ?: ""
       val token = config["token"] as? String ?: ""
       val userId = config["userId"] as? String ?: ""
@@ -111,15 +113,18 @@ class LiveTrackModule : Module() {
 
       // Record a permission-delta event (PERMISSION_GRANTED/REVOKED) vs last seen.
       scope.launch { runCatching { checkPermissionDelta(context) } }
+
+      promise.resolve(null)
     }
 
     // stop(): stop the foreground service and tear down keep-alive.
-    Function("stop") {
+    AsyncFunction("stop") { promise: Promise ->
       context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
         .putBoolean(Prefs.KEY_WAS_TRACKING, false).apply()
       runCatching { Watchdog.cancel(context) }
       runCatching { UploadWorker.cancelPeriodic(context) }
       context.stopService(Intent(context, TrackingService::class.java))
+      promise.resolve(null)
     }
 
     // getState(): snapshot of tracking/permission/services/battery/buffer.
@@ -168,11 +173,10 @@ class LiveTrackModule : Module() {
         }
       }.toTypedArray()
 
-      // VERIFY: Permissions.askForPermissionsWithPermissionsManager(manager, promise, vararg).
-      // We ignore the manager's aggregate result and resolve our own TrackerState
-      // so JS gets a consistent shape; the callback fires after the OS dialog.
-      Permissions.askForPermissionsWithPermissionsManager(
-        permissionsManager,
+      // Use the instance method that accepts a listener (the static helper only
+      // takes a Promise, not a listener). We ignore the manager's aggregate
+      // result and resolve our own TrackerState so JS gets a consistent shape.
+      permissionsManager.askForPermissions(
         object : expo.modules.interfaces.permissions.PermissionsResponseListener {
           override fun onResult(
             // VERIFY: Java interface declares Map<String, PermissionsResponse>.

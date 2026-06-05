@@ -63,3 +63,6 @@ dist/
 # Expo
 .expo/
 .expo/*
+
+example/android/
+example/ios/

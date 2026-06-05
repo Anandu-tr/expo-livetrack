@@ -34,10 +34,15 @@ dependencies {
   // VERIFY: 21.3.0 is the current stable play-services-location at time of writing.
   implementation "com.google.android.gms:play-services-location:21.3.0"
 
-  // Room persistence (buffer). // VERIFY: 2.6.1 is current stable Room.
-  implementation "androidx.room:room-runtime:2.6.1"
-  implementation "androidx.room:room-ktx:2.6.1"
-  kapt "androidx.room:room-compiler:2.6.1"
+  // ServiceCompat.startForeground(service, id, notification, foregroundServiceType)
+  // requires androidx.core 1.12+; pin explicitly so we don't depend on whatever
+  // the host app pulls in transitively.
+  implementation "androidx.core:core-ktx:1.13.1"
+
+  // Room persistence (buffer). // VERIFY: 2.7.1 is current stable Room.
+  implementation "androidx.room:room-runtime:2.7.1"
+  implementation "androidx.room:room-ktx:2.7.1"
+  kapt "androidx.room:room-compiler:2.7.1"
 
   // WorkManager — dep added so the future uploader worker has a home; not wired
   // in this slice. // VERIFY: 2.9.1 is current stable WorkManager.
@@ -50,7 +55,7 @@ dependencies {
   // VERIFY: all test dependency versions below.
   testImplementation "org.robolectric:robolectric:4.12.2"
   testImplementation "androidx.test:core:1.6.1"
-  testImplementation "androidx.room:room-testing:2.6.1"
+  testImplementation "androidx.room:room-testing:2.7.1"
   testImplementation "junit:junit:4.13.2"
   testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1"
 }

@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "expo-livetrack-example",
+    "slug": "expo-livetrack-example",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.example.expolivetrack"
+    },
+    "android": {
+      "package": "com.example.expolivetrack"
+    },
+    "plugins": [
+      [
+        "expo-livetrack",
+        {
+          "locationWhenInUse": "We use your location to record your field visits and route while you are using the app.",
+          "locationAlways": "We continue to record your location in the background, even when the app is closed, so your full route and distance travelled are captured for work reporting."
+        }
+      ]
+    ]
+  }
+}
