@@ -23,6 +23,14 @@
           }
         },
         {
+          "client_id": "280378540912-o4q9p11trlqk3t2qoc4m8iuadneukuu0.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.expolivetrack",
+            "certificate_hash": "5e8f16062ea3cd2c4a0d547876baa6f38cabf625"
+          }
+        },
+        {
           "client_id": "280378540912-8ag6ohgc7tgkpvu8mfnsb305kgjt7215.apps.googleusercontent.com",
           "client_type": 3
         }
