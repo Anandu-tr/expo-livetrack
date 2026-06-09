@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "tracks": {
+      "$uid": {
+        // A signed-in user may read their OWN track data only.
+        ".read": "auth != null && auth.uid === $uid",
+        // Direct client writes are denied. All writes go through the `ingest`
+        // Cloud Function, which uses the Admin SDK and bypasses these rules.
+        ".write": false
+      }
+    }
+  }
+}

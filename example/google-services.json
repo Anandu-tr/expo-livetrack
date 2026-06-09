@@ -1,0 +1,55 @@
+{
+  "project_info": {
+    "project_number": "280378540912",
+    "firebase_url": "https://simconnect-e111e-default-rtdb.firebaseio.com",
+    "project_id": "simconnect-e111e",
+    "storage_bucket": "simconnect-e111e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:280378540912:android:1f8f23e8eac67f19f0c5b5",
+        "android_client_info": {
+          "package_name": "com.example.expolivetrack"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "280378540912-ir2ktmq2fai41j1ht2mrg8gocmor2h9l.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.expolivetrack",
+            "certificate_hash": "52f4a8808c75d95c809e950ecd443c801a0cab52"
+          }
+        },
+        {
+          "client_id": "280378540912-8ag6ohgc7tgkpvu8mfnsb305kgjt7215.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCC0QKxmoP_xulqCV8yCPZuAFbg-danvYA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "280378540912-8ag6ohgc7tgkpvu8mfnsb305kgjt7215.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "280378540912-10m22n9dj7ujfjeagoed4mkadua4e5nn.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.expolivetrack"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

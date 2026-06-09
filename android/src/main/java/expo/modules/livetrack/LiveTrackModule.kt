@@ -148,8 +148,13 @@ class LiveTrackModule : Module() {
       }
     }
 
-    // requestPermissions(): request fine + background location (+ POST_NOTIFICATIONS
-    // on 33+, ACTIVITY_RECOGNITION on 29+), then resolve the resulting state.
+    // requestPermissions(): request foreground location (+ ACTIVITY_RECOGNITION on
+    // 29+, POST_NOTIFICATIONS on 33+) FIRST, then escalate to background location
+    // in a SECOND step once foreground is granted, finally resolving the state.
+    //
+    // Two steps are mandatory: on Android 11+ (API 30+) the system IGNORES the
+    // entire request — showing no dialog at all — if ACCESS_BACKGROUND_LOCATION is
+    // asked for in the same call as the foreground location permissions.
     AsyncFunction("requestPermissions") { promise: Promise ->
       val permissionsManager = appContext.permissions
         ?: return@AsyncFunction promise.reject(
@@ -158,13 +163,9 @@ class LiveTrackModule : Module() {
           null,
         )
 
-      val perms = buildList {
+      val foreground = buildList {
         add(Manifest.permission.ACCESS_FINE_LOCATION)
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
-        // Background location must usually be requested separately/after foreground
-        // on API 30+; we include it here for simplicity. // VERIFY: on Android 11+
-        // the OS may ignore background in the same prompt — host may need a 2-step flow.
-        add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
           add(Manifest.permission.ACTIVITY_RECOGNITION)
         }
@@ -173,32 +174,41 @@ class LiveTrackModule : Module() {
         }
       }.toTypedArray()
 
-      // Use the instance method that accepts a listener (the static helper only
-      // takes a Promise, not a listener). We ignore the manager's aggregate
-      // result and resolve our own TrackerState so JS gets a consistent shape.
+      // Step 1: foreground set. We ignore the manager's aggregate result and
+      // resolve our own TrackerState so JS gets a consistent shape.
       permissionsManager.askForPermissions(
         object : expo.modules.interfaces.permissions.PermissionsResponseListener {
           override fun onResult(
-            // VERIFY: Java interface declares Map<String, PermissionsResponse>.
             result: MutableMap<String, expo.modules.interfaces.permissions.PermissionsResponse>,
           ) {
-            scope.launch {
-              runCatching {
-                val ctx = context
-                val bufferedCount = BufferDb.getInstance(ctx).pointDao().count()
-                val state = Bundle().apply {
-                  putBoolean("tracking", TrackingService.isRunning)
-                  putString("permission", permissionState(ctx))
-                  putBoolean("locationServices", isLocationEnabled(ctx))
-                  putBoolean("batteryOptIgnored", isBatteryOptIgnored(ctx))
-                  putInt("bufferedCount", bufferedCount)
-                }
-                promise.resolve(state)
-              }.onFailure { promise.reject("ERR_REQUEST_PERMISSIONS", it.message, it) }
+            val ctx = context
+            val fineGranted = ContextCompat.checkSelfPermission(
+              ctx, Manifest.permission.ACCESS_FINE_LOCATION,
+            ) == PackageManager.PERMISSION_GRANTED
+            val needsBackground = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+              ContextCompat.checkSelfPermission(
+                ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+              ) != PackageManager.PERMISSION_GRANTED
+
+            // Step 2: only ask for background once foreground is actually granted;
+            // requesting it before would be silently denied.
+            if (fineGranted && needsBackground) {
+              permissionsManager.askForPermissions(
+                object : expo.modules.interfaces.permissions.PermissionsResponseListener {
+                  override fun onResult(
+                    result: MutableMap<String, expo.modules.interfaces.permissions.PermissionsResponse>,
+                  ) {
+                    resolvePermissionState(promise)
+                  }
+                },
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+              )
+            } else {
+              resolvePermissionState(promise)
             }
           }
         },
-        *perms,
+        *foreground,
       )
     }
 
@@ -291,6 +301,25 @@ class LiveTrackModule : Module() {
   // --- Helpers ------------------------------------------------------------
 
   /** "granted" (fine + background), "background" (fine only), "denied" otherwise. */
+  // Build and resolve the current TrackerState off the main thread. Shared by the
+  // (possibly two-step) permission request flow.
+  private fun resolvePermissionState(promise: Promise) {
+    scope.launch {
+      runCatching {
+        val ctx = context
+        val bufferedCount = BufferDb.getInstance(ctx).pointDao().count()
+        val state = Bundle().apply {
+          putBoolean("tracking", TrackingService.isRunning)
+          putString("permission", permissionState(ctx))
+          putBoolean("locationServices", isLocationEnabled(ctx))
+          putBoolean("batteryOptIgnored", isBatteryOptIgnored(ctx))
+          putInt("bufferedCount", bufferedCount)
+        }
+        promise.resolve(state)
+      }.onFailure { promise.reject("ERR_REQUEST_PERMISSIONS", it.message, it) }
+    }
+  }
+
   private fun permissionState(ctx: Context): String {
     val fine = ContextCompat.checkSelfPermission(
       ctx, Manifest.permission.ACCESS_FINE_LOCATION,

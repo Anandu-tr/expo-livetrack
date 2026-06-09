@@ -6,10 +6,12 @@
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "ios": {
-      "bundleIdentifier": "com.example.expolivetrack"
+      "bundleIdentifier": "com.example.expolivetrack",
+      "googleServicesFile": "./GoogleService-Info.plist"
     },
     "android": {
-      "package": "com.example.expolivetrack"
+      "package": "com.example.expolivetrack",
+      "googleServicesFile": "./google-services.json"
     },
     "plugins": [
       [
@@ -17,6 +19,22 @@
         {
           "locationWhenInUse": "We use your location to record your field visits and route while you are using the app.",
           "locationAlways": "We continue to record your location in the background, even when the app is closed, so your full route and distance travelled are captured for work reporting."
+        }
+      ],
+      "@react-native-firebase/app",
+      "@react-native-firebase/auth",
+      [
+        "@react-native-google-signin/google-signin",
+        {
+          "iosUrlScheme": "com.googleusercontent.apps.280378540912-10m22n9dj7ujfjeagoed4mkadua4e5nn"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "static"
+          }
         }
       ]
     ]
