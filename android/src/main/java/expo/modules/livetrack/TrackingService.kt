@@ -18,6 +18,7 @@ import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.google.android.gms.location.ActivityRecognition
+import com.google.android.gms.location.ActivityRecognitionResult
 import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.ActivityTransitionResult
@@ -77,6 +78,7 @@ class TrackingService : Service() {
   private var lastHeartbeatAt: Long = 0L
 
   private var activityPendingIntent: PendingIntent? = null
+  private var activitySamplePendingIntent: PendingIntent? = null
 
   // Runtime-registered so PROVIDERS_CHANGED is reliably delivered while we're
   // alive (manifest delivery of this implicit broadcast is often suppressed).
@@ -104,6 +106,10 @@ class TrackingService : Service() {
     // here as a re-delivered start intent with ACTION_ACTIVITY_TRANSITION.
     if (intent?.action == ACTION_ACTIVITY_TRANSITION) {
       handleActivityTransition(intent)
+      return START_STICKY
+    }
+    if (intent?.action == ACTION_ACTIVITY_SAMPLE) {
+      handleActivitySample(intent)
       return START_STICKY
     }
 
@@ -263,6 +269,11 @@ class TrackingService : Service() {
     val battery = readBattery()
     val mock = isMock(loc)
 
+    // Prefer the Activity Recognition label when we actually have one; otherwise
+    // (AR not yet reported, or unavailable/denied) derive a coarse label from GPS
+    // speed so `act` isn't perpetually UNKNOWN.
+    val act = if (currentActivity != "UNKNOWN") currentActivity else speedActivity(loc)
+
     val point = PointEntity(
       userId = userId,
       t = System.currentTimeMillis(),
@@ -273,7 +284,7 @@ class TrackingService : Service() {
       speed = loc.speed.toDouble(),
       batt = battery.first,
       charging = battery.second,
-      act = currentActivity,
+      act = act,
       mock = mock,
       eventType = null,
     )
@@ -378,36 +389,47 @@ class TrackingService : Service() {
 
   private fun requestActivityUpdates() {
     try {
-      val intent = Intent(this, TrackingService::class.java).apply {
-        action = ACTION_ACTIVITY_TRANSITION
-      }
-      // getService delivers the transition result back into onStartCommand,
-      // avoiding a BroadcastReceiver (which is a later task). // VERIFY: getService + flags.
-      val pi = PendingIntent.getService(
+      val client = ActivityRecognition.getClient(this)
+
+      // (a) Transitions drive responsive still<->moving cadence switching.
+      val transitionPi = PendingIntent.getService(
         this,
         REQ_ACTIVITY,
-        intent,
+        Intent(this, TrackingService::class.java).apply { action = ACTION_ACTIVITY_TRANSITION },
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
       )
-      activityPendingIntent = pi
-      // VERIFY: ActivityRecognition.getClient(this).requestActivityTransitionUpdates(request, pi).
-      // Requires ACTIVITY_RECOGNITION runtime permission (API 29+); failure is swallowed.
-      ActivityRecognition.getClient(this)
-        .requestActivityTransitionUpdates(activityTransitionRequest(), pi)
+      activityPendingIntent = transitionPi
+      client.requestActivityTransitionUpdates(activityTransitionRequest(), transitionPi)
+
+      // (b) Sampling periodically reports the CURRENT most-probable activity. This
+      // seeds the activity at startup (transitions alone never report a current
+      // state) and continuously corrects stale labels (e.g. stuck WALKING).
+      val samplePi = PendingIntent.getService(
+        this,
+        REQ_ACTIVITY_SAMPLE,
+        Intent(this, TrackingService::class.java).apply { action = ACTION_ACTIVITY_SAMPLE },
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+      )
+      activitySamplePendingIntent = samplePi
+      client.requestActivityUpdates(SAMPLE_INTERVAL_MS, samplePi)
     } catch (e: Exception) {
-      // AR is an enhancement; capture still works at the moving cadence.
+      // AR is an enhancement; capture still works at the moving cadence and the
+      // GPS-speed fallback supplies an activity label. Surface the cause (most
+      // often a denied ACTIVITY_RECOGNITION permission or missing Play Services).
+      android.util.Log.w(TAG, "Activity Recognition unavailable; using speed fallback", e)
     }
   }
 
   private fun removeActivityUpdates() {
-    val pi = activityPendingIntent ?: return
-    try {
-      // VERIFY: removeActivityTransitionUpdates(pendingIntent).
-      ActivityRecognition.getClient(this).removeActivityTransitionUpdates(pi)
-    } catch (e: Exception) {
-      // ignore
+    val client = ActivityRecognition.getClient(this)
+    activityPendingIntent?.let { pi ->
+      runCatching { client.removeActivityTransitionUpdates(pi) }
+    }
+    activitySamplePendingIntent?.let { pi ->
+      runCatching { client.removeActivityUpdates(pi) }
     }
     activityPendingIntent = null
+    activitySamplePendingIntent = null
   }
 
   private fun handleActivityTransition(intent: Intent) {
@@ -430,6 +452,31 @@ class TrackingService : Service() {
       }
     } catch (e: Exception) {
       // ignore malformed transition payloads
+    }
+  }
+
+  // Periodic current-activity sample. Unlike transitions, this reports the
+  // most-probable activity RIGHT NOW, so it seeds the label at startup and
+  // continuously corrects stale values. Reconciled through the same helpers as
+  // transitions to keep isStill / currentActivity / cadence consistent.
+  private fun handleActivitySample(intent: Intent) {
+    try {
+      if (!ActivityRecognitionResult.hasResult(intent)) return
+      val result = ActivityRecognitionResult.extractResult(intent) ?: return
+      val mostProbable = result.mostProbableActivity
+      if (mostProbable.confidence < MIN_CONFIDENCE) return
+      when (mostProbable.type) {
+        DetectedActivity.STILL -> onEnterStill()
+        DetectedActivity.UNKNOWN, DetectedActivity.TILTING -> {
+          // Not actionable: don't overwrite a known label with UNKNOWN/TILTING.
+        }
+        else -> {
+          currentActivity = activityName(mostProbable.type)
+          if (isStill) onExitStill()
+        }
+      }
+    } catch (e: Exception) {
+      // ignore malformed sample payloads
     }
   }
 
@@ -476,6 +523,19 @@ class TrackingService : Service() {
     )
   }
 
+  // Coarse GPS-speed-derived activity, used only as a fallback when Activity
+  // Recognition has given no usable label. Thresholds are conservative and
+  // tunable; GPS speed can jitter slightly when truly stationary. Returns
+  // "UNKNOWN" when the fix carries no speed (avoids a false "STILL").
+  private fun speedActivity(loc: Location): String {
+    if (!loc.hasSpeed()) return "UNKNOWN"
+    return when {
+      loc.speed < 0.5f -> "STILL" // ~<1.8 km/h
+      loc.speed < 2.5f -> "WALKING" // ~<9 km/h
+      else -> "IN_VEHICLE"
+    }
+  }
+
   private fun activityName(type: Int): String = when (type) {
     DetectedActivity.STILL -> "STILL"
     DetectedActivity.WALKING -> "WALKING"
@@ -488,11 +548,19 @@ class TrackingService : Service() {
   }
 
   companion object {
+    private const val TAG = "LiveTrack"
     const val CHANNEL_ID = "livetrack"
     const val NOTIF_ID = 4711
     private const val REQ_ACTIVITY = 1001
+    private const val REQ_ACTIVITY_SAMPLE = 1002
+
+    // How often the Activity Recognition sampler reports the current activity.
+    private const val SAMPLE_INTERVAL_MS = 10_000L
+    // Minimum confidence (0-100) before we trust a sampled activity.
+    private const val MIN_CONFIDENCE = 50
 
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
+    const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"
 
     const val EXTRA_USER_ID = "userId"
     const val EXTRA_URL = "url"

@@ -61,7 +61,8 @@
       "Bash(echo \"=== BUILD EXIT: $? ===\")",
       "Bash(firebase deploy *)",
       "Bash(sudo chown -R 504:20 ~/.npm)",
-      "Read(//Users/muhammadajmal-2/.npm/**)"
+      "Read(//Users/muhammadajmal-2/.npm/**)",
+      "Bash(./gradlew :expo-livetrack:compileDebugKotlin --offline)"
     ]
   }
 }
