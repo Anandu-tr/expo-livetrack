@@ -121,6 +121,14 @@ export default function App() {
   // `ingest` function verifies it and writes to RTDB under tracks/<uid>.
   // ---------------------------------------------------------------------------
   const startTracking = async (current: FirebaseAuthTypes.User) => {
+    // Only prompt when permissions aren't already fully granted. A returning
+    // user with location (incl. background) intact goes straight to tracking —
+    // no dialog, no separate "Request Permissions" tap. Android keeps the grant
+    // across launches, so this is a no-op on every run after the first.
+    const state = await LiveTracker.getState();
+    if (state.permission !== 'granted') {
+      await LiveTracker.requestPermissions();
+    }
     const idToken = await current.getIdToken();
     await LiveTracker.start({
       url: TRACK_URL,

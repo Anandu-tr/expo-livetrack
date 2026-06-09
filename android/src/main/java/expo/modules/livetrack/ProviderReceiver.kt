@@ -99,8 +99,10 @@ class ProviderReceiver : BroadcastReceiver() {
     }
     runCatching { LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_EVENT, payload) }
 
-    // A LOCATION_ON event is a good moment to flush whatever queued up.
-    if (enabled) runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(context) }
+    // Flush right away so the OFF/ON event reaches the server when it happened,
+    // not batched until the next fix or restart. GPS being off doesn't affect
+    // network, so the OFF row can still upload.
+    runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(context) }
   }
 
   private fun lastKnown(context: Context, lm: LocationManager): Pair<Double?, Double?> {
