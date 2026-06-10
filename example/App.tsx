@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Platform,
   Pressable,
   Modal,
@@ -64,18 +65,21 @@ function Button({
   title,
   onPress,
   color,
+  disabled,
 }: {
   title: string;
   onPress: () => void;
   color?: string;
+  disabled?: boolean;
 }) {
   return (
     <Pressable
       onPress={onPress}
+      disabled={disabled}
       style={({ pressed }) => [
         {
-          backgroundColor: color ?? '#2196F3',
-          opacity: pressed ? 0.7 : 1,
+          backgroundColor: disabled ? '#b0b0b0' : color ?? '#2196F3',
+          opacity: disabled ? 1 : pressed ? 0.7 : 1,
           paddingVertical: 10,
           paddingHorizontal: 16,
           borderRadius: 4,
@@ -101,6 +105,10 @@ export default function App() {
 
   // Controls our OWN prominent-disclosure modal (shown before start()).
   const [disclosureVisible, setDisclosureVisible] = useState(false);
+  // "Allow all the time" coaching modal, shown right before the OS permission
+  // prompts so the user knows which option to pick on the background-location
+  // settings screen.
+  const [permHelpVisible, setPermHelpVisible] = useState(false);
 
   // Guard so we don't stack multiple "location is off" alerts.
   const locationOffAlertOpen = useRef(false);
@@ -294,8 +302,20 @@ export default function App() {
     setDisclosureVisible(true);
   };
 
-  const onDisclosureAccept = async () => {
+  // Disclosure accepted → show the "Allow all the time" coaching modal next,
+  // BEFORE the OS prompts, so the user is primed for the background-location
+  // settings screen.
+  const onDisclosureAccept = () => {
     setDisclosureVisible(false);
+    if (!user) {
+      return;
+    }
+    setPermHelpVisible(true);
+  };
+
+  // Coaching modal dismissed → now run the real permission + start sequence.
+  const onPermHelpContinue = async () => {
+    setPermHelpVisible(false);
     if (!user) {
       return;
     }
@@ -384,10 +404,19 @@ export default function App() {
         <View style={styles.group}>
           <Text style={styles.groupHeader}>Controls</Text>
           <View style={styles.buttonRow}>
-            <Button title="Start" onPress={onStartPressed} />
+            <Button
+              title="Start"
+              onPress={onStartPressed}
+              disabled={state?.tracking === true}
+            />
           </View>
           <View style={styles.buttonRow}>
-            <Button title="Stop" color="#b00020" onPress={onStop} />
+            <Button
+              title="Stop"
+              color="#b00020"
+              onPress={onStop}
+              disabled={!state?.tracking}
+            />
           </View>
         </View>
 
@@ -463,6 +492,37 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      {/* "Allow all the time" coaching modal — shown right before the OS prompts.
+          Android requests background location on a SETTINGS screen where the user
+          must pick "Allow all the time"; the screenshot makes that unmissable. */}
+      <Modal
+        visible={permHelpVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPermHelpVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Choose “Allow all the time”</Text>
+            <Text style={styles.modalBody}>
+              On the next screens, grant location access and — when asked about
+              background location — select{' '}
+              <Text style={{ fontWeight: '700' }}>“Allow all the time”</Text>. The app
+              needs this to keep recording your route in the background.
+            </Text>
+            <Image
+              source={require('./assets/allow-all-time.png')}
+              style={styles.permHelpImage}
+              resizeMode="contain"
+            />
+            <View style={styles.modalButtons}>
+              <Button title="Not now" onPress={() => setPermHelpVisible(false)} />
+              <Button title="Continue" onPress={onPermHelpContinue} />
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -512,6 +572,13 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   modalCard: { backgroundColor: '#fff', borderRadius: 12, padding: 20 },
+  permHelpImage: {
+    width: '100%',
+    height: 320,
+    borderRadius: 8,
+    backgroundColor: '#eee',
+    marginBottom: 12,
+  },
   modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 12 },
   modalBody: { fontSize: 15, lineHeight: 21, marginBottom: 12 },
   modalButtons: {
