@@ -305,19 +305,11 @@ export default function App() {
       setState(next);
 
       // 2) GPS / location services must be ON for tracking. If off, pop the OS
-      //    "turn on location" dialog and wait for the user to enable it. Tracking
-      //    needs GPS the whole time, so we refuse to start without it.
+      //    one-tap "turn on location" dialog, which enables GPS in place (no trip
+      //    to Settings), then give it a moment to take effect before continuing.
       if (!next.locationServices) {
         await LiveTracker.requestEnableLocation();
-        const enabled = await waitForGps(10000);
-        if (!enabled) {
-          Alert.alert(
-            'Location required',
-            'GPS / location must stay ON for tracking to work. Please turn on ' +
-              'location, then tap Start again.'
-          );
-          return;
-        }
+        await waitForGps(8000);
       }
 
       // 3) Ask the OS to exempt us from battery optimisation (keep-alive popup).
