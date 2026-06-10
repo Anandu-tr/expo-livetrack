@@ -15,13 +15,14 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Platform,
   Pressable,
   Modal,
   SafeAreaView,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
 
@@ -98,12 +99,6 @@ export default function App() {
   // sign-in screen while a persisted session is being restored.
   const [initializing, setInitializing] = useState(true);
 
-  // Phone / OTP sign-in state. Both the number and the (test) OTP are entered
-  // up front and submitted together.
-  const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
-  const [busy, setBusy] = useState(false);
-
   // Controls our OWN prominent-disclosure modal (shown before start()).
   const [disclosureVisible, setDisclosureVisible] = useState(false);
 
@@ -121,14 +116,6 @@ export default function App() {
   // `ingest` function verifies it and writes to RTDB under tracks/<uid>.
   // ---------------------------------------------------------------------------
   const startTracking = async (current: FirebaseAuthTypes.User) => {
-    // Only prompt when permissions aren't already fully granted. A returning
-    // user with location (incl. background) intact goes straight to tracking —
-    // no dialog, no separate "Request Permissions" tap. Android keeps the grant
-    // across launches, so this is a no-op on every run after the first.
-    const state = await LiveTracker.getState();
-    if (state.permission !== 'granted') {
-      await LiveTracker.requestPermissions();
-    }
     const idToken = await current.getIdToken();
     await LiveTracker.start({
       url: TRACK_URL,
@@ -243,22 +230,6 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // Button handlers
   // ---------------------------------------------------------------------------
-  const onRequestPermissions = async () => {
-    try {
-      const next = await LiveTracker.requestPermissions();
-      setState(next);
-    } catch (err) {
-      Alert.alert('Permission request failed', String(err));
-    }
-  };
-
-  const onEnsureNotKilled = async () => {
-    try {
-      await LiveTracker.ensureNotKilled();
-    } catch (err) {
-      Alert.alert('ensureNotKilled failed', String(err));
-    }
-  };
 
   // Sign in with Google → exchange for a Firebase credential.
   const onGoogleSignIn = async () => {
@@ -284,40 +255,6 @@ export default function App() {
     }
   };
 
-  // Phone / OTP sign-in in a single step. For a Firebase *test* number the code
-  // is pre-defined, so there's no real SMS to wait for: we kick off
-  // signInWithPhoneNumber (required to obtain a confirmation handle) and confirm
-  // with the entered test OTP back-to-back. `user` then updates via
-  // onAuthStateChanged, which switches the UI to the app screen.
-  const onPhoneSignIn = async () => {
-    if (!phone.trim()) {
-      Alert.alert('Enter a phone number', 'Use E.164 format, e.g. +1 650-555-3434.');
-      return;
-    }
-    if (!code.trim()) {
-      Alert.alert('Enter the OTP', 'Enter the test OTP for this number.');
-      return;
-    }
-    setBusy(true);
-    try {
-      // Test/fictional numbers resolve against their canned OTP without a real
-      // Play Integrity / reCAPTCHA + SMS round-trip. Dev-only so production
-      // keeps real verification.
-      if (__DEV__) {
-        auth().settings.appVerificationDisabledForTesting = true;
-      }
-      const c = await auth().signInWithPhoneNumber(phone.trim());
-      await c.confirm(code.trim());
-      // Clear local state; the auth listener handles the screen switch.
-      setPhone('');
-      setCode('');
-    } catch (err: any) {
-      Alert.alert('Phone sign-in failed', String(err?.message ?? err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const onSignOut = async () => {
     try {
       await LiveTracker.stop();
@@ -330,12 +267,12 @@ export default function App() {
     } catch (err) {
       Alert.alert('Sign-out failed', String(err));
     }
-    setPhone('');
-    setCode('');
   };
 
-  // Start is a TWO-step flow: show our prominent-disclosure modal FIRST, then
-  // only call start() once the user explicitly accepts.
+  // Start is the single entry point: show the prominent-disclosure modal FIRST
+  // (store policy requires it before requesting background location), then on
+  // accept run the whole setup chain — permission prompts, battery-optimisation
+  // exemption — and finally start tracking.
   const onStartPressed = () => {
     if (!user) {
       Alert.alert('Sign in first', 'Sign in with Google before starting tracking.');
@@ -350,9 +287,15 @@ export default function App() {
       return;
     }
     try {
+      // 1) Location permissions (foreground, then background on Android 11+).
+      const next = await LiveTracker.requestPermissions();
+      setState(next);
+      // 2) Ask the OS to exempt us from battery optimisation (keep-alive popup).
+      await LiveTracker.ensureNotKilled();
+      // 3) Start the foreground tracking service.
       await startTracking(user);
     } catch (err) {
-      Alert.alert('start failed', String(err));
+      Alert.alert('Could not start tracking', String(err));
     }
   };
 
@@ -374,41 +317,14 @@ export default function App() {
     );
   }
 
-  // Signed out → the ONLY thing the user can do is sign in (Google or phone/OTP).
+  // Signed out → the ONLY thing the user can do is sign in with Google.
   if (!user) {
     return (
       <SafeAreaView style={[styles.container, styles.center]}>
         <View style={styles.signInCard}>
           <Text style={styles.header}>expo-livetrack demo</Text>
           <Text style={styles.modalBody}>Sign in to start tracking.</Text>
-
           <Button title="Sign in with Google" onPress={onGoogleSignIn} />
-
-          <View style={styles.divider} />
-
-          <Text style={styles.hint}>Or sign in with a test phone number + OTP:</Text>
-          <TextInput
-            style={styles.input}
-            value={phone}
-            onChangeText={setPhone}
-            placeholder="+1 650-555-3434"
-            keyboardType="phone-pad"
-            autoComplete="tel"
-            editable={!busy}
-          />
-          <TextInput
-            style={styles.input}
-            value={code}
-            onChangeText={setCode}
-            placeholder="OTP (e.g. 123456)"
-            keyboardType="number-pad"
-            autoComplete="sms-otp"
-            editable={!busy}
-          />
-          <Button
-            title={busy ? 'Signing in…' : 'Sign in with phone'}
-            onPress={onPhoneSignIn}
-          />
         </View>
       </SafeAreaView>
     );
@@ -416,7 +332,7 @@ export default function App() {
 
   // Signed in → the full app.
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, styles.safeTop]}>
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.header}>expo-livetrack demo</Text>
 
@@ -433,22 +349,18 @@ export default function App() {
         ) : null}
 
         <View style={styles.group}>
-          <Text style={styles.groupHeader}>Account</Text>
+          <View style={styles.accountHeader}>
+            <Text style={styles.groupHeader}>Account</Text>
+            <Pressable onPress={onSignOut} hitSlop={8}>
+              <Text style={styles.linkText}>Sign out</Text>
+            </Pressable>
+          </View>
           <Text style={styles.line}>signed in: {user.email ?? user.uid}</Text>
           <Text style={styles.line}>uid: {user.uid}</Text>
-          <View style={styles.buttonRow}>
-            <Button title="Sign out" color="#555" onPress={onSignOut} />
-          </View>
         </View>
 
         <View style={styles.group}>
           <Text style={styles.groupHeader}>Controls</Text>
-          <View style={styles.buttonRow}>
-            <Button title="Request Permissions" onPress={onRequestPermissions} />
-          </View>
-          <View style={styles.buttonRow}>
-            <Button title="Ensure Not Killed" onPress={onEnsureNotKilled} />
-          </View>
           <View style={styles.buttonRow}>
             <Button title="Start" onPress={onStartPressed} />
           </View>
@@ -535,6 +447,8 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#eee' },
+  // RN's SafeAreaView only insets on iOS; pad past the status bar on Android too.
+  safeTop: { paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight ?? 0 : 0 },
   center: { justifyContent: 'center', alignItems: 'center', padding: 24 },
   signInCard: {
     backgroundColor: '#fff',
@@ -542,16 +456,6 @@ const styles = StyleSheet.create({
     padding: 24,
     width: '100%',
     gap: 16,
-  },
-  divider: { height: 1, backgroundColor: '#ddd', marginVertical: 4 },
-  hint: { fontSize: 14, color: '#555' },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
   },
   content: { padding: 16 },
   header: { fontSize: 28, fontWeight: '600', marginBottom: 16 },
@@ -562,6 +466,12 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   groupHeader: { fontSize: 18, fontWeight: '600', marginBottom: 12 },
+  accountHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  linkText: { color: '#2196F3', fontWeight: '600' },
   buttonRow: { marginBottom: 8 },
   line: { fontSize: 14, marginBottom: 4, fontFamily: 'Courier' },
   banner: {
