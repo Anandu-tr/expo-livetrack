@@ -1,6 +1,11 @@
 {
   "rules": {
     "tracks": {
+      // DEV ONLY: open read so the apps/web dashboard can list users and view
+      // any user's route without per-user auth. This exposes all track data
+      // publicly — replace with an admin/viewer-UID rule (or restore the
+      // per-$uid ".read" below) before any real deployment.
+      ".read": true,
       "$uid": {
         // A signed-in user may read their OWN track data only.
         ".read": "auth != null && auth.uid === $uid",
@@ -8,6 +13,13 @@
         // Cloud Function, which uses the Admin SDK and bypasses these rules.
         ".write": false
       }
+    },
+    "users": {
+      // Identity profiles (name/email/phone) written by the ingest function so
+      // dashboards can label users. DEV ONLY: open read — lock down before any
+      // real deployment. Writes are Admin-SDK only.
+      ".read": true,
+      ".write": false
     }
   }
 }

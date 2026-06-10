@@ -54,8 +54,9 @@ export const ingest = onRequest({cors: false, maxInstances: 10}, async (req, res
   }
 
   let uid: string;
+  let decoded: admin.auth.DecodedIdToken;
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
+    decoded = await admin.auth().verifyIdToken(token);
     uid = decoded.uid;
   } catch (err) {
     logger.warn("ID token verification failed", (err as Error).message);
@@ -70,6 +71,16 @@ export const ingest = onRequest({cors: false, maxInstances: 10}, async (req, res
   // Build a single multi-location update so the whole batch lands atomically.
   const updates: Record<string, unknown> = {};
   const acceptedIds: string[] = [];
+
+  // Persist a minimal identity profile so dashboards can label users by
+  // name/email/phone instead of the opaque uid. Sourced from the verified ID
+  // token's claims; refreshed on every ingest. Reads at /users/{uid}.
+  updates[`users/${uid}`] = {
+    displayName: decoded.name ?? null,
+    email: decoded.email ?? null,
+    phoneNumber: decoded.phone_number ?? null,
+    updatedAt: admin.database.ServerValue.TIMESTAMP,
+  };
 
   for (const p of points) {
     if (!p || p.id == null) continue;
@@ -88,9 +99,8 @@ export const ingest = onRequest({cors: false, maxInstances: 10}, async (req, res
   }
 
   try {
-    if (acceptedIds.length > 0) {
-      await admin.database().ref().update(updates);
-    }
+    // updates always carries the /users/{uid} profile, so this runs every call.
+    await admin.database().ref().update(updates);
   } catch (err) {
     logger.error("RTDB write failed", (err as Error).message);
     res.status(500).json({error: "write-failed"});
