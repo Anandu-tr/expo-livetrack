@@ -125,6 +125,19 @@ export default function App() {
     });
   };
 
+  // Poll getState() until location services (GPS) are ON, or time out.
+  // requestEnableLocation() pops the OS dialog but resolves with the pre-decision
+  // state, so the truth has to be re-read here after the user responds.
+  const waitForGps = async (timeoutMs: number): Promise<boolean> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const s = await LiveTracker.getState();
+      if (s.locationServices) return true;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return false;
+  };
+
   // ---------------------------------------------------------------------------
   // Auth: keep `user` in sync with Firebase, and restore the auth UI on launch.
   // ---------------------------------------------------------------------------
@@ -290,9 +303,26 @@ export default function App() {
       // 1) Location permissions (foreground, then background on Android 11+).
       const next = await LiveTracker.requestPermissions();
       setState(next);
-      // 2) Ask the OS to exempt us from battery optimisation (keep-alive popup).
+
+      // 2) GPS / location services must be ON for tracking. If off, pop the OS
+      //    "turn on location" dialog and wait for the user to enable it. Tracking
+      //    needs GPS the whole time, so we refuse to start without it.
+      if (!next.locationServices) {
+        await LiveTracker.requestEnableLocation();
+        const enabled = await waitForGps(10000);
+        if (!enabled) {
+          Alert.alert(
+            'Location required',
+            'GPS / location must stay ON for tracking to work. Please turn on ' +
+              'location, then tap Start again.'
+          );
+          return;
+        }
+      }
+
+      // 3) Ask the OS to exempt us from battery optimisation (keep-alive popup).
       await LiveTracker.ensureNotKilled();
-      // 3) Start the foreground tracking service.
+      // 4) Start the foreground tracking service.
       await startTracking(user);
     } catch (err) {
       Alert.alert('Could not start tracking', String(err));
