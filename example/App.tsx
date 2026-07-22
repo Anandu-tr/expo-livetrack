@@ -1,4 +1,5 @@
 import auth, { type FirebaseAuthTypes } from '@react-native-firebase/auth';
+import crashlytics from '@react-native-firebase/crashlytics';
 import {
   GoogleSignin,
   statusCodes,
@@ -130,6 +131,11 @@ export default function App() {
       token: idToken,
       userId: current.uid,
       cadence: TEST_CADENCE,
+      // Native TokenProvider (Option B): the background uploader mints a fresh
+      // token itself via this app-supplied class, so draining survives the app
+      // being killed. Wired by example/plugins/withLiveTrackTokenProvider.js.
+      tokenProviderClass: 'com.example.expolivetrack.FirebaseTokenProvider',
+      diagnostics: { crashlytics: true },
     });
   };
 
@@ -210,6 +216,13 @@ export default function App() {
 
     const syncErrorSub = LiveTracker.onSyncError(async (err) => {
       setSyncError(err);
+
+      // Breadcrumb + non-fatal so foreground sync failures are visible in
+      // Crashlytics alongside the native upload/SQL non-fatals.
+      crashlytics().log(`syncError status=${err.status ?? '?'} buffered=${err.bufferedCount ?? '?'}`);
+      if (err.status) {
+        crashlytics().recordError(new Error(`livetrack sync ${err.status}: ${err.message}`));
+      }
 
       // Firebase ID tokens expire after ~1h. The module captured the token at
       // start(), so once it expires the function returns 401/403. Refresh the

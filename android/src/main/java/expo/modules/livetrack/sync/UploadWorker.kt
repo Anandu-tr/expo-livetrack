@@ -13,6 +13,8 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import expo.modules.livetrack.LiveTrackEventBus
+import expo.modules.livetrack.Prefs
+import expo.modules.livetrack.diagnostics.DiagnosticsReporters
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
@@ -49,17 +51,40 @@ class UploadWorker(
   override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
     val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     val url = prefs.getString("url", null)
-    val token = prefs.getString("token", null)
+    var token = prefs.getString("token", null)
     val batchSize = prefs.getInt("batchSize", 50)
+    val reporter = DiagnosticsReporters.resolve(prefs)
+    val provider = loadProvider(prefs)
 
-    if (url.isNullOrBlank() || token.isNullOrBlank()) {
+    if (url.isNullOrBlank()) {
       // Not configured (yet) — nothing we can do; don't retry forever.
+      return@withContext Result.success()
+    }
+
+    // Proactive refresh: ask the provider for a current token before posting. The
+    // provider returns a still-valid cached token cheaply, or mints a fresh one if
+    // the previous has expired — so this works even when the app's JS is dead.
+    if (provider != null) {
+      val fresh = runCatching { provider.freshToken(false) }.getOrNull()
+      if (fresh != null) {
+        token = fresh
+        prefs.edit().putString("token", fresh).apply()
+      } else {
+        reporter.recordFailure("token-provider", "freshToken(false) returned null")
+      }
+    }
+
+    if (token.isNullOrBlank()) {
       return@withContext Result.success()
     }
 
     val dao: PointDao = BufferDb.getInstance(applicationContext).pointDao()
 
     val rows = runCatching { dao.unsynced(batchSize) }.getOrElse {
+      reporter.recordFailure(
+        "db-read", it.message ?: "unsynced failed",
+        mapOf("batchSize" to batchSize.toString()),
+      )
       // DB read failure — let WorkManager back off and retry.
       return@withContext Result.retry()
     }
@@ -67,34 +92,86 @@ class UploadWorker(
 
     val body = buildBody(rows)
 
-    val outcome = try {
+    var outcome = try {
       post(url, token, body)
     } catch (e: Exception) {
+      reporter.recordFailure(
+        "upload-network", e.message ?: "network error",
+        mapOf("bufferedCount" to (runCatching { dao.count() }.getOrDefault(-1)).toString()),
+      )
       // Network/transport failure — emit best-effort error + retry with backoff.
       emitSyncError(e.message ?: "network error", null, dao)
       return@withContext Result.retry()
+    }
+
+    // Reactive refresh: a single 401 -> force a fresh token -> retry the batch once.
+    if (outcome.code == 401 && provider != null) {
+      val fresh = runCatching { provider.freshToken(true) }.getOrNull()
+      if (fresh != null) {
+        token = fresh
+        prefs.edit().putString("token", fresh).apply()
+        outcome = try {
+          post(url, token, body)
+        } catch (e: Exception) {
+          reporter.recordFailure("upload-network", e.message ?: "network error after refresh")
+          emitSyncError(e.message ?: "network error", null, dao)
+          return@withContext Result.retry()
+        }
+      } else {
+        reporter.recordFailure("token-provider", "freshToken(true) returned null")
+      }
     }
 
     when {
       outcome.code in 200..299 -> {
         val acceptedIds = parseAcceptedIds(outcome.body)
         if (acceptedIds.isNotEmpty()) {
-          runCatching { dao.deleteByIds(acceptedIds) }
+          runCatching { dao.deleteByIds(acceptedIds) }.onFailure {
+            reporter.recordFailure(
+              "db-write", it.message ?: "deleteByIds failed",
+              mapOf("idsCount" to acceptedIds.size.toString()),
+            )
+          }
         }
         Result.success()
       }
       // 401/403 and other non-retryable client errors: stop retrying.
       outcome.code == 401 || outcome.code == 403 || outcome.code in 400..499 -> {
+        reporter.recordFailure(
+          "upload-http", "server rejected",
+          mapOf("status" to outcome.code.toString(), "host" to host(url)),
+        )
         emitSyncError("server rejected (${outcome.code})", outcome.code, dao)
         Result.failure()
       }
       // 5xx and anything else: transient — retry with backoff.
       else -> {
+        reporter.recordFailure(
+          "upload-http", "server error",
+          mapOf("status" to outcome.code.toString(), "host" to host(url)),
+        )
         emitSyncError("server error (${outcome.code})", outcome.code, dao)
         Result.retry()
       }
     }
   }
+
+  // --- Token provider -----------------------------------------------------
+
+  /**
+   * Reflectively load the app-supplied [TokenProvider] named in config. Cached
+   * process-wide so we don't re-instantiate per run. Returns null if unconfigured
+   * or the class can't be loaded (then we fall back to the stored static token).
+   */
+  private fun loadProvider(prefs: android.content.SharedPreferences): TokenProvider? {
+    val className = prefs.getString(Prefs.KEY_TOKEN_PROVIDER_CLASS, null) ?: return null
+    cachedProvider?.let { if (it::class.java.name == className) return it }
+    return runCatching {
+      (Class.forName(className).getDeclaredConstructor().newInstance() as TokenProvider)
+    }.getOrNull()?.also { cachedProvider = it }
+  }
+
+  private fun host(u: String): String = runCatching { URL(u).host }.getOrDefault("?")
 
   // --- Body building ------------------------------------------------------
 
@@ -193,6 +270,10 @@ class UploadWorker(
   companion object {
     private const val PREFS = "livetrack_prefs"
     private const val TIMEOUT_MS = 30_000
+
+    /** Reflectively-loaded token provider, cached process-wide. */
+    @Volatile
+    private var cachedProvider: TokenProvider? = null
 
     private const val UNIQUE_ONE_TIME = "livetrack_upload"
     private const val UNIQUE_PERIODIC = "livetrack_upload_periodic"

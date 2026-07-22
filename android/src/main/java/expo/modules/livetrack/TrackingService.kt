@@ -61,6 +61,11 @@ class TrackingService : Service() {
 
   private lateinit var fused: FusedLocationProviderClient
   private val dao: PointDao by lazy { BufferDb.getInstance(applicationContext).pointDao() }
+  private val reporter: expo.modules.livetrack.diagnostics.DiagnosticsReporter by lazy {
+    expo.modules.livetrack.diagnostics.DiagnosticsReporters.resolve(
+      getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE),
+    )
+  }
 
   // Resolved from start-intent extras.
   private var userId: String = ""
@@ -289,7 +294,11 @@ class TrackingService : Service() {
       eventType = null,
     )
 
-    scope.launch { dao.insert(point) }
+    scope.launch {
+      runCatching { dao.insert(point) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(location) failed", mapOf("hasLocation" to "true"))
+      }
+    }
 
     // Nudge the uploader after buffering a fix (unique+KEEP, so cheap to repeat).
     expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext)
@@ -515,7 +524,11 @@ class TrackingService : Service() {
       act = "STILL",
       eventType = "HEARTBEAT",
     )
-    scope.launch { dao.insert(row) }
+    scope.launch {
+      runCatching { dao.insert(row) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(event) failed", mapOf("hasLocation" to "false"))
+      }
+    }
     expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext)
     LiveTrackEventBus.emit(
       LiveTrackEventBus.EVENT_EVENT,

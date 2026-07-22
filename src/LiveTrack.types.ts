@@ -15,11 +15,26 @@ export interface Cadence {
   maxAccuracyM?: number; // default 50
 }
 
+/** Opt-in operational diagnostics. `crashlytics` routes native upload/SQL failures to Crashlytics. */
+export interface Diagnostics {
+  crashlytics?: boolean;
+}
+
 export interface StartConfig {
   url: string;
   token: string;
   userId: string;
   cadence?: Cadence;
+  /**
+   * Fully-qualified class name of a native `TokenProvider` implementation that
+   * mints a fresh auth token on demand (so the background uploader can refresh
+   * even when the app's JS is not running). The plugin loads it by reflection,
+   * staying auth-vendor-agnostic; the implementation lives in the host app. For
+   * Firebase, point this at a class that calls
+   * `FirebaseAuth.getInstance().currentUser.getIdToken(...)`.
+   */
+  tokenProviderClass?: string;
+  diagnostics?: Diagnostics;
 }
 
 export interface TrackerState {

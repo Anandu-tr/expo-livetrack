@@ -82,19 +82,26 @@ export const ingest = onRequest({cors: false, maxInstances: 10}, async (req, res
     updatedAt: admin.database.ServerValue.TIMESTAMP,
   };
 
+  // Owner is taken from the verified token, never the payload: every row is
+  // stored under this token's uid, so there is no mismatch. The only thing we
+  // ever drop is a row with no id (it can't be keyed) — counted, not stored.
+  let skippedNoId = 0;
+
   for (const p of points) {
-    if (!p || p.id == null) continue;
-    // Defence-in-depth: a token only writes to its own subtree, and we ignore
-    // any row claiming a different owner than the verified uid.
-    if (p.u != null && p.u !== uid) continue;
-    updates[`tracks/${uid}/points/${p.id}`] = p;
+    if (!p || p.id == null) {
+      skippedNoId++;
+      continue;
+    }
+    updates[`tracks/${uid}/points/${p.id}`] = {...p, u: uid};
     acceptedIds.push(String(p.id));
   }
 
   for (const e of events) {
-    if (!e || e.id == null) continue;
-    if (e.u != null && e.u !== uid) continue;
-    updates[`tracks/${uid}/events/${e.id}`] = e;
+    if (!e || e.id == null) {
+      skippedNoId++;
+      continue;
+    }
+    updates[`tracks/${uid}/events/${e.id}`] = {...e, u: uid};
     acceptedIds.push(String(e.id));
   }
 
@@ -107,6 +114,12 @@ export const ingest = onRequest({cors: false, maxInstances: 10}, async (req, res
     return;
   }
 
-  logger.info(`ingest ok uid=${uid} points=${points.length} events=${events.length}`);
+  // Minimal but enough to debug a stuck buffer: who, how much arrived, the exact
+  // ids stored (next batch should no longer contain them), and any dropped rows.
+  logger.info(`ingest uid=${uid}`, {
+    received: `${points.length}p/${events.length}e`,
+    acceptedIds,
+    ...(skippedNoId > 0 && {rejected: {count: skippedNoId, reason: "missing-id"}}),
+  });
   res.status(200).json({acceptedIds});
 });

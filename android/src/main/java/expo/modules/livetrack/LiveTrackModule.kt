@@ -81,6 +81,11 @@ class LiveTrackModule : Module() {
       val maxAccuracyM = numDouble(cadence["maxAccuracyM"], 50.0)
       val batchSize = numLong(cadence["batchSize"], 50L).toInt()
 
+      val tokenProviderClass = config["tokenProviderClass"] as? String
+      @Suppress("UNCHECKED_CAST")
+      val diagnostics = config["diagnostics"] as? Map<String, Any?> ?: emptyMap()
+      val crashlyticsOn = diagnostics["crashlytics"] as? Boolean ?: false
+
       // Persist for the uploader + reboot re-arm. wasTracking lets BootReceiver
       // / Watchdog know whether to resume after a reboot or process death.
       context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
@@ -92,6 +97,8 @@ class LiveTrackModule : Module() {
         putLong("stillIntervalMs", stillIntervalMs)
         putFloat("maxAccuracyM", maxAccuracyM.toFloat())
         putInt("batchSize", batchSize)
+        putBoolean(Prefs.KEY_DIAGNOSTICS_CRASHLYTICS, crashlyticsOn)
+        putString(Prefs.KEY_TOKEN_PROVIDER_CLASS, tokenProviderClass)
         putBoolean(Prefs.KEY_WAS_TRACKING, true)
         apply()
       }

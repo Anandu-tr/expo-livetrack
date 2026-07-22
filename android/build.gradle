@@ -51,6 +51,12 @@ dependencies {
   // Kotlin coroutines for off-main-thread DB/IO. // VERIFY: 1.8.1 current stable.
   implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
 
+  // Soft dependency: the plugin compiles against Crashlytics but never bundles it.
+  // The host app supplies the SDK (via @react-native-firebase/crashlytics). If absent
+  // at runtime, DiagnosticsReporters.resolve() degrades to Noop.
+  // VERIFY: align 19.2.1 with the Firebase BoM the host app resolves.
+  compileOnly "com.google.firebase:firebase-crashlytics:19.2.1"
+
   // --- Unit test (Robolectric + in-memory Room). Requires a gradle host to run. ---
   // VERIFY: all test dependency versions below.
   testImplementation "org.robolectric:robolectric:4.12.2"

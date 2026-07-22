@@ -12,6 +12,7 @@
   "dependencies": {
     "@react-native-firebase/app": "^21.6.1",
     "@react-native-firebase/auth": "^21.6.1",
+    "@react-native-firebase/crashlytics": "^21.14.0",
     "@react-native-firebase/database": "^21.6.1",
     "@react-native-google-signin/google-signin": "^13.1.0",
     "expo": "~54.0.35",
@@ -25,5 +26,10 @@
     "@types/react": "~19.1.1",
     "babel-preset-expo": "~13.2.5",
     "typescript": "~5.9.2"
+  },
+  "expo": {
+    "autolinking": {
+      "exclude": ["@expo/dom-webview", "@expo/log-box"]
+    }
   }
 }

@@ -32,9 +32,10 @@ abstract class BufferDb : RoomDatabase() {
         BufferDb::class.java,
         DB_NAME,
       )
-        // Buffer is disposable telemetry; a destructive reset on schema change is
-        // acceptable and far safer than crashing the capture path on migration.
-        .fallbackToDestructiveMigration()
+        // NO destructive fallback: the buffer holds un-uploaded user data that must
+        // survive app updates. A future schema change MUST add an explicit Migration
+        // here. Until then there are no migrations to register (version is unchanged),
+        // and existing data is preserved across updates.
         .build()
   }
 }

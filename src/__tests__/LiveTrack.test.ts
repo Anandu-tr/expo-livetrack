@@ -36,6 +36,22 @@ test('start fills cadence defaults and forwards to native', async () => {
   );
 });
 
+test('start forwards tokenProviderClass and diagnostics to native', async () => {
+  await LiveTracker.start({
+    url: 'u',
+    token: 'tok',
+    userId: 'x',
+    tokenProviderClass: 'com.example.expolivetrack.FirebaseTokenProvider',
+    diagnostics: { crashlytics: true },
+  });
+  expect(native.start).toHaveBeenCalledWith(
+    expect.objectContaining({
+      tokenProviderClass: 'com.example.expolivetrack.FirebaseTokenProvider',
+      diagnostics: { crashlytics: true },
+    }),
+  );
+});
+
 test('caller cadence overrides win', async () => {
   await LiveTracker.start({ url: 'u', token: 't', userId: 'x', cadence: { movingIntervalMs: 5000 } });
   const arg = (native.start as jest.Mock).mock.calls.at(-1)![0];
