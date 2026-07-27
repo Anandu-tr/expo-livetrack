@@ -19,29 +19,42 @@
     "expo-livetrack",
     "LiveTrack"
   ],
-  "repository": "",
+  "files": [
+    "build",
+    "plugin/build",
+    "android",
+    "ios",
+    "app.plugin.js",
+    "expo-module.config.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anandu-tr/expo-livetrack.git"
+  },
   "bugs": {
-    "url": "/issues"
+    "url": "https://github.com/Anandu-tr/expo-livetrack/issues"
   },
   "author": "Anandu <cto.claude@mileseducation.com> ()",
   "license": "MIT",
-  "homepage": "#readme",
+  "homepage": "https://github.com/Anandu-tr/expo-livetrack#readme",
   "dependencies": {
-    "@expo/config-plugins": "^56.0.0"
+    "@expo/config-plugins": "^54.0.0"
   },
   "devDependencies": {
     "@babel/core": "^7.26.0",
-    "@expo/config-types": "^56.0.0",
+    "@expo/config-types": "^54.0.0",
     "@types/jest": "^29.2.1",
     "@types/react": "~19.1.1",
-    "babel-preset-expo": "~55.0.8",
+    "babel-preset-expo": "~54.0.9",
     "eslint": "~9.39.4",
     "eslint-config-universe": "^15.0.3",
-    "expo": "^56.0.7",
+    "expo": "~54.0.31",
     "jest": "^29.7.0",
-    "jest-expo": "~55.0.9",
+    "jest-expo": "~54.0.12",
     "prettier": "^3.0.0",
-    "react-native": "0.82.1",
+    "react-native": "0.81.5",
     "typescript": "^5.9.2"
   },
   "jest": {
