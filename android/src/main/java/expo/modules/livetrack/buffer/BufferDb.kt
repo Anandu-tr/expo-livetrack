@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 /**
  * Room database backing the offline location/event buffer.
@@ -11,7 +13,7 @@ import androidx.room.RoomDatabase
  * Single-table schema (`points`). Process-wide singleton via [getInstance] so the
  * capture service and the module bridge share one connection.
  */
-@Database(entities = [PointEntity::class], version = 1, exportSchema = false)
+@Database(entities = [PointEntity::class], version = 2, exportSchema = false)
 abstract class BufferDb : RoomDatabase() {
   abstract fun pointDao(): PointDao
 
@@ -20,6 +22,22 @@ abstract class BufferDb : RoomDatabase() {
 
     @Volatile
     private var instance: BufferDb? = null
+
+    /**
+     * v1 -> v2: adds `attempts`, the retry counter that bounds re-upload loops.
+     *
+     * ADDITIVE ONLY — no table rebuild, no data copy, so every un-uploaded row
+     * survives the app update. `NOT NULL` is legal in `ALTER TABLE ADD COLUMN`
+     * precisely because a DEFAULT is supplied; the matching
+     * `@ColumnInfo(defaultValue = "0")` on the entity keeps the fresh-install
+     * CREATE TABLE identical, so Room's post-migration validation passes on both
+     * install paths.
+     */
+    val MIGRATION_1_2 = object : Migration(1, 2) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE `points` ADD COLUMN `attempts` INTEGER NOT NULL DEFAULT 0")
+      }
+    }
 
     fun getInstance(context: Context): BufferDb =
       instance ?: synchronized(this) {
@@ -33,9 +51,9 @@ abstract class BufferDb : RoomDatabase() {
         DB_NAME,
       )
         // NO destructive fallback: the buffer holds un-uploaded user data that must
-        // survive app updates. A future schema change MUST add an explicit Migration
-        // here. Until then there are no migrations to register (version is unchanged),
-        // and existing data is preserved across updates.
+        // survive app updates. Every schema bump MUST register an explicit Migration
+        // here, so existing data is preserved across updates.
+        .addMigrations(MIGRATION_1_2)
         .build()
   }
 }

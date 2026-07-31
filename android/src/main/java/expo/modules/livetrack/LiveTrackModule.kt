@@ -79,7 +79,12 @@ class LiveTrackModule : Module() {
       val movingDistanceM = numDouble(cadence["movingDistanceM"], 30.0).toFloat()
       val stillIntervalMs = numLong(cadence["stillIntervalMs"], 120_000L)
       val maxAccuracyM = numDouble(cadence["maxAccuracyM"], 50.0)
-      val batchSize = numLong(cadence["batchSize"], 50L).toInt()
+      // Clamped to the uploader's SQL-variable budget: `deleteByIds`/`incrementAttempts`
+      // bind one variable per id and SQLITE_MAX_VARIABLE_NUMBER is 999 on older SQLite.
+      val batchSize = numLong(cadence["batchSize"], 50L).toInt().coerceIn(1, 500)
+      val maxUploadAttempts = numLong(
+        cadence["maxUploadAttempts"], UploadWorker.DEFAULT_MAX_UPLOAD_ATTEMPTS.toLong(),
+      ).toInt().coerceAtLeast(1)
 
       val tokenProviderClass = config["tokenProviderClass"] as? String
       @Suppress("UNCHECKED_CAST")
@@ -89,14 +94,15 @@ class LiveTrackModule : Module() {
       // Persist for the uploader + reboot re-arm. wasTracking lets BootReceiver
       // / Watchdog know whether to resume after a reboot or process death.
       context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
-        putString("url", url)
-        putString("token", token)
-        putString("userId", userId)
-        putLong("movingIntervalMs", movingIntervalMs)
-        putFloat("movingDistanceM", movingDistanceM)
-        putLong("stillIntervalMs", stillIntervalMs)
-        putFloat("maxAccuracyM", maxAccuracyM.toFloat())
-        putInt("batchSize", batchSize)
+        putString(Prefs.KEY_URL, url)
+        putString(Prefs.KEY_TOKEN, token)
+        putString(Prefs.KEY_USER_ID, userId)
+        putLong(Prefs.KEY_MOVING_INTERVAL_MS, movingIntervalMs)
+        putFloat(Prefs.KEY_MOVING_DISTANCE_M, movingDistanceM)
+        putLong(Prefs.KEY_STILL_INTERVAL_MS, stillIntervalMs)
+        putFloat(Prefs.KEY_MAX_ACCURACY_M, maxAccuracyM.toFloat())
+        putInt(Prefs.KEY_BATCH_SIZE, batchSize)
+        putInt(Prefs.KEY_MAX_UPLOAD_ATTEMPTS, maxUploadAttempts)
         putBoolean(Prefs.KEY_DIAGNOSTICS_CRASHLYTICS, crashlyticsOn)
         putString(Prefs.KEY_TOKEN_PROVIDER_CLASS, tokenProviderClass)
         putBoolean(Prefs.KEY_WAS_TRACKING, true)

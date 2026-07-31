@@ -61,6 +61,28 @@ GPS provider).
 
 ---
 
+## Crash-reporter payloads (opt-in)
+
+When the host enables `diagnostics: { crashlytics: true }`, operational failures are
+recorded as non-fatals. These go to **your** crash reporter, not to any endpoint the
+package chooses, and are off by default.
+
+| Attribute | What it contains | Notes |
+| --- | --- | --- |
+| `status`, `host` | HTTP status and the **hostname** of your configured `url` | No path, no query string |
+| `rowsSent`, `bufferedCount`, `parsedCount` | Counts only | No location values |
+| `sampleSent`, `sampleParsed`, `sampleIds` | Up to 10 local SQLite row ids | Opaque integers; not user identifiers |
+| `bodySnippet` | First 300 chars of your server's **response** body, whitespace-collapsed | Emitted only on a 2xx the client could not read (`upload-ack-empty` / `upload-ack-foreign`) |
+
+`bodySnippet` exists so a non-conforming ack format is diagnosable rather than
+silently stalling the buffer. It captures your own server's response — if that
+response embeds personal data, it will be included, so review what your ingest
+endpoint returns before enabling `diagnostics.crashlytics`.
+
+No latitude, longitude, token, or user id is placed in any diagnostic attribute.
+
+---
+
 ## Declaration notes
 
 - **Do not** declare advertising or analytics-vendor purposes — none of this data

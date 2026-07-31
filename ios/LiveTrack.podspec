@@ -1,6 +1,7 @@
 Pod::Spec.new do |s|
   s.name           = 'LiveTrack'
-  s.version        = '1.0.0'
+  # Keep in step with package.json / android/build.gradle.
+  s.version        = '0.2.0'
   s.summary        = 'Reliable background location tracker (LiveTrack)'
   s.description    = 'CLLocationManager capture + durable SQLite buffer + batched uploader.'
   s.author         = ''

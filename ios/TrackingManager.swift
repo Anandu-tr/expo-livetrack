@@ -14,6 +14,18 @@ struct TrackingConfig: Codable {
   let batchSize: Int
   let maxAccuracyM: Double
 
+  /// MUST stay Optional. This struct is persisted to UserDefaults, and Swift's
+  /// synthesized `Decodable` does NOT apply property defaults for missing keys — a
+  /// non-optional new field would make `load()` return nil for every device that
+  /// already has a config blob, silently killing the cold-relaunch re-arm path in
+  /// `resumeIfNeeded()`. Read it through `effectiveMaxUploadAttempts`.
+  let maxUploadAttempts: Int?
+
+  /// Attempt budget with the back-compat fallback applied.
+  var effectiveMaxUploadAttempts: Int {
+    max(maxUploadAttempts ?? Uploader.defaultMaxUploadAttempts, 1)
+  }
+
   private static let key = "expo.modules.livetrack.config"
 
   func save() {
@@ -283,7 +295,10 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
 
   private func triggerSync() {
     guard let cfg = config else { return }
-    Uploader.shared.sync(url: cfg.url, token: cfg.token, batchSize: cfg.batchSize)
+    Uploader.shared.sync(
+      url: cfg.url, token: cfg.token, batchSize: cfg.batchSize,
+      maxAttempts: cfg.effectiveMaxUploadAttempts
+    )
   }
 
   // MARK: - Events to JS (always on main)

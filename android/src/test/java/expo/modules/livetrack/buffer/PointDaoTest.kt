@@ -60,4 +60,55 @@ class PointDaoTest {
     assertEquals(0, dao.count())
     assertTrue(dao.unsynced(50).isEmpty())
   }
+
+  @Test
+  fun unsynced_tiebreaksOnIdSoBatchesAreStableAcrossRuns() {
+    // Same millisecond: without the `id ASC` tiebreak the order is unspecified, and
+    // the attempts counter would smear across rows instead of converging.
+    val a = dao.insert(PointEntity(userId = "u1", t = 7L, lat = 1.0, lng = 1.0))
+    val b = dao.insert(PointEntity(userId = "u1", t = 7L, lat = 2.0, lng = 2.0))
+    val c = dao.insert(PointEntity(userId = "u1", t = 7L, lat = 3.0, lng = 3.0))
+
+    repeat(3) {
+      assertEquals(listOf(a, b), dao.unsynced(2).map { row -> row.id })
+    }
+    assertEquals(listOf(a, b, c), dao.unsynced(50).map { row -> row.id })
+  }
+
+  @Test
+  fun newRowsStartAtZeroAttempts_andIncrementAttemptsBumpsOnlyNamedIds() {
+    val id1 = dao.insert(PointEntity(userId = "u1", t = 1L, lat = 1.0, lng = 1.0))
+    val id2 = dao.insert(PointEntity(userId = "u1", t = 2L, eventType = "HEARTBEAT"))
+
+    assertTrue(dao.unsynced(50).all { it.attempts == 0 })
+
+    assertEquals(1, dao.incrementAttempts(listOf(id1)))
+    assertEquals(1, dao.incrementAttempts(listOf(id1)))
+
+    val byId = dao.unsynced(50).associateBy { it.id }
+    assertEquals(2, byId.getValue(id1).attempts)
+    assertEquals(0, byId.getValue(id2).attempts)
+  }
+
+  @Test
+  fun evictionQueries_onlyTouchRowsAtOrOverTheCap() {
+    val stuck = dao.insert(PointEntity(userId = "u1", t = 1L, lat = 1.0, lng = 1.0))
+    val fresh = dao.insert(PointEntity(userId = "u1", t = 2L, lat = 2.0, lng = 2.0))
+
+    repeat(3) { dao.incrementAttempts(listOf(stuck)) }
+    dao.incrementAttempts(listOf(fresh))
+
+    // Cap of 3: only `stuck` qualifies.
+    assertEquals(listOf(stuck), dao.idsExceedingAttempts(3, 20))
+    assertEquals(1L, dao.oldestExceedingAttempts(3))
+
+    assertEquals(1, dao.deleteExceedingAttempts(3))
+    assertEquals(1, dao.count())
+    assertEquals(listOf(fresh), dao.unsynced(50).map { it.id })
+
+    // Nothing left at/over the cap — the eviction path must now be a no-op.
+    assertTrue(dao.idsExceedingAttempts(3, 20).isEmpty())
+    assertEquals(null, dao.oldestExceedingAttempts(3))
+    assertEquals(0, dao.deleteExceedingAttempts(3))
+  }
 }

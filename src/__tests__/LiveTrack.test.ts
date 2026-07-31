@@ -31,6 +31,7 @@ test('start fills cadence defaults and forwards to native', async () => {
         stillIntervalMs: 120000,
         batchSize: 50,
         maxAccuracyM: 50,
+        maxUploadAttempts: 15,
       }),
     }),
   );
@@ -57,6 +58,14 @@ test('caller cadence overrides win', async () => {
   const arg = (native.start as jest.Mock).mock.calls.at(-1)![0];
   expect(arg.cadence.movingIntervalMs).toBe(5000);
   expect(arg.cadence.batchSize).toBe(50); // other defaults still applied
+});
+
+test('maxUploadAttempts defaults to 15 and is overridable', async () => {
+  await LiveTracker.start({ url: 'u', token: 't', userId: 'x' });
+  expect((native.start as jest.Mock).mock.calls.at(-1)![0].cadence.maxUploadAttempts).toBe(15);
+
+  await LiveTracker.start({ url: 'u', token: 't', userId: 'x', cadence: { maxUploadAttempts: 2 } });
+  expect((native.start as jest.Mock).mock.calls.at(-1)![0].cadence.maxUploadAttempts).toBe(2);
 });
 
 test('pass-through methods forward to native', async () => {

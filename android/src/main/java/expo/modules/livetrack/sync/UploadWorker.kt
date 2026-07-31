@@ -14,6 +14,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import expo.modules.livetrack.LiveTrackEventBus
 import expo.modules.livetrack.Prefs
+import expo.modules.livetrack.diagnostics.DiagnosticsReporter
 import expo.modules.livetrack.diagnostics.DiagnosticsReporters
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointDao
@@ -37,8 +38,9 @@ import java.util.concurrent.TimeUnit
  * ```
  * A buffer row is a location when `eventType == null` (goes in `points`), else an
  * event (goes in `events`, `e = eventType`). Each `id` is the Room row id as a
- * String. Response 200: `{ "acceptedIds": ["<rowId>", ...] }`; only rows whose
- * ids come back are deleted — the rest are retried by the next run.
+ * String. Response 2xx: `{ "acceptedIds": ["<rowId>", ...] }` (see [AckParser] for
+ * the envelope/field variants tolerated); only rows whose ids come back are
+ * deleted — the rest are retried by the next run, up to [DEFAULT_MAX_UPLOAD_ATTEMPTS].
  *
  * HttpURLConnection is used (not OkHttp) to avoid relying on a transitive dep we
  * cannot confirm here. // VERIFY: HttpURLConnection is always on Android; fine.
@@ -50,9 +52,14 @@ class UploadWorker(
 
   override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
     val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    val url = prefs.getString("url", null)
-    var token = prefs.getString("token", null)
-    val batchSize = prefs.getInt("batchSize", 50)
+    val url = prefs.getString(Prefs.KEY_URL, null)
+    var token = prefs.getString(Prefs.KEY_TOKEN, null)
+    // Clamp on READ as well as on write: `batchSize` is host-supplied and older
+    // builds persisted it unclamped, so an oversized value could still be sitting
+    // in prefs. An oversized IN (:ids) list throws "too many SQL variables".
+    val batchSize = prefs.getInt(Prefs.KEY_BATCH_SIZE, 50).coerceIn(1, SQL_VAR_CHUNK)
+    val maxAttempts = prefs.getInt(Prefs.KEY_MAX_UPLOAD_ATTEMPTS, DEFAULT_MAX_UPLOAD_ATTEMPTS)
+      .coerceAtLeast(1)
     val reporter = DiagnosticsReporters.resolve(prefs)
     val provider = loadProvider(prefs)
 
@@ -68,7 +75,7 @@ class UploadWorker(
       val fresh = runCatching { provider.freshToken(false) }.getOrNull()
       if (fresh != null) {
         token = fresh
-        prefs.edit().putString("token", fresh).apply()
+        prefs.edit().putString(Prefs.KEY_TOKEN, fresh).apply()
       } else {
         reporter.recordFailure("token-provider", "freshToken(false) returned null")
       }
@@ -109,7 +116,7 @@ class UploadWorker(
       val fresh = runCatching { provider.freshToken(true) }.getOrNull()
       if (fresh != null) {
         token = fresh
-        prefs.edit().putString("token", fresh).apply()
+        prefs.edit().putString(Prefs.KEY_TOKEN, fresh).apply()
         outcome = try {
           post(url, token, body)
         } catch (e: Exception) {
@@ -123,18 +130,8 @@ class UploadWorker(
     }
 
     when {
-      outcome.code in 200..299 -> {
-        val acceptedIds = parseAcceptedIds(outcome.body)
-        if (acceptedIds.isNotEmpty()) {
-          runCatching { dao.deleteByIds(acceptedIds) }.onFailure {
-            reporter.recordFailure(
-              "db-write", it.message ?: "deleteByIds failed",
-              mapOf("idsCount" to acceptedIds.size.toString()),
-            )
-          }
-        }
-        Result.success()
-      }
+      outcome.code in 200..299 ->
+        handleAccepted(outcome, rows.map { it.id }, dao, reporter, url, maxAttempts)
       // 401/403 and other non-retryable client errors: stop retrying.
       outcome.code == 401 || outcome.code == 403 || outcome.code in 400..499 -> {
         reporter.recordFailure(
@@ -217,18 +214,120 @@ class UploadWorker(
     }.toString()
   }
 
-  private fun parseAcceptedIds(body: String?): List<Long> {
-    if (body.isNullOrBlank()) return emptyList()
-    return runCatching {
-      val arr = JSONObject(body).optJSONArray("acceptedIds") ?: JSONArray()
-      buildList {
-        for (i in 0 until arr.length()) {
-          // ids are sent as Strings; tolerate numbers too.
-          arr.optString(i, null)?.toLongOrNull()?.let { add(it) }
+  // --- ACK handling -------------------------------------------------------
+
+  /**
+   * Classify a 2xx response and reconcile the buffer against it.
+   *
+   * WHY THIS EXISTS: a 2xx that acknowledged NOTHING used to be treated as full
+   * success — no delete, no counter, no signal — so devices re-POSTed the same 50
+   * rows indefinitely with zero observability (observed in production: the same
+   * batch every 40 s–7 min for hours, across two independent devices). Now every
+   * 2xx is classified: acked rows are deleted, unacked rows are counted, a zero-ack
+   * response is always reported with a body snippet (so the real server shape
+   * becomes visible), and rows that exhaust their attempts are evicted and reported.
+   */
+  private fun handleAccepted(
+    outcome: HttpOutcome,
+    sentIds: List<Long>,
+    dao: PointDao,
+    reporter: DiagnosticsReporter,
+    url: String,
+    maxAttempts: Int,
+  ): Result {
+    val parsed = AckParser.parse(outcome.body)
+    val sentSet = sentIds.toSet()
+    // Only ever delete ids we actually sent. A server echoing its OWN primary keys
+    // instead of our row ids must not be able to delete an unrelated buffered row
+    // by coincidence — that would be silent data loss.
+    val accepted = parsed.filter { it in sentSet }
+    val acceptedSet = accepted.toSet()
+    val unacked = sentIds.filterNot { it in acceptedSet }
+
+    accepted.chunked(SQL_VAR_CHUNK).forEach { chunk ->
+      runCatching { dao.deleteByIds(chunk) }.onFailure {
+        reporter.recordFailure(
+          "db-write", it.message ?: "deleteByIds failed",
+          mapOf("idsCount" to chunk.size.toString()),
+        )
+      }
+    }
+
+    if (accepted.isEmpty()) {
+      // Fires on attempt #1, hours before any eviction — this is the missing signal
+      // that let the production loop run unnoticed.
+      reporter.recordFailure(
+        if (parsed.isEmpty()) "upload-ack-empty" else "upload-ack-foreign",
+        if (parsed.isEmpty()) "2xx with zero parseable acceptedIds"
+        else "2xx acked ${parsed.size} ids, none of them ours",
+        mapOf(
+          "status" to outcome.code.toString(),
+          "host" to host(url),
+          "rowsSent" to sentIds.size.toString(),
+          "parsedCount" to parsed.size.toString(),
+          "sampleSent" to sentIds.take(3).joinToString(","),
+          "sampleParsed" to parsed.take(3).joinToString(","),
+          "bodyLen" to (outcome.body?.length ?: 0).toString(),
+          "bodySnippet" to snippet(outcome.body),
+          "bufferedCount" to (runCatching { dao.count() }.getOrDefault(-1)).toString(),
+        ),
+      )
+    }
+
+    if (unacked.isNotEmpty()) {
+      unacked.chunked(SQL_VAR_CHUNK).forEach { chunk ->
+        runCatching { dao.incrementAttempts(chunk) }.onFailure {
+          reporter.recordFailure(
+            "db-write", it.message ?: "incrementAttempts failed",
+            mapOf("idsCount" to chunk.size.toString()),
+          )
         }
       }
-    }.getOrDefault(emptyList())
+      evictExhausted(dao, reporter, maxAttempts)
+    }
+
+    // Zero acks -> hand back to WorkManager's exponential backoff instead of
+    // success(), so a server that 2xx's while acknowledging nothing cannot drive a
+    // hot per-fix retry loop (that loop was the observed battery cost).
+    // Partial/full acks -> success(): real progress was made, let the next nudge run.
+    return if (accepted.isEmpty()) Result.retry() else Result.success()
   }
+
+  /**
+   * Bounded, logged eviction — the ONLY path that can drop a buffered row without a
+   * server ACK. Reached only for rows the server has affirmatively declined
+   * [maxAttempts] separate times under a 2xx.
+   */
+  private fun evictExhausted(dao: PointDao, reporter: DiagnosticsReporter, maxAttempts: Int) {
+    val sample = runCatching { dao.idsExceedingAttempts(maxAttempts, 20) }.getOrDefault(emptyList())
+    if (sample.isEmpty()) return
+    val oldestT = runCatching { dao.oldestExceedingAttempts(maxAttempts) }.getOrNull()
+    val evicted = runCatching { dao.deleteExceedingAttempts(maxAttempts) }.getOrElse {
+      reporter.recordFailure("db-write", it.message ?: "deleteExceedingAttempts failed")
+      return
+    }
+    if (evicted <= 0) return
+    reporter.recordFailure(
+      "buffer-evicted",
+      "dropped $evicted rows after $maxAttempts unacknowledged 2xx uploads",
+      mapOf(
+        "evictedCount" to evicted.toString(),
+        "maxAttempts" to maxAttempts.toString(),
+        "sampleIds" to sample.take(10).joinToString(","),
+        "oldestT" to (oldestT?.toString() ?: "?"),
+      ),
+    )
+    emitSyncError(
+      "dropped $evicted buffered rows after $maxAttempts failed uploads", null, dao, evicted,
+    )
+  }
+
+  /**
+   * Collapsed + truncated: an HTML error page from a proxy would otherwise blow the
+   * crash reporter's per-key size limit.
+   */
+  private fun snippet(body: String?): String =
+    (body ?: "").replace(WHITESPACE, " ").trim().take(BODY_SNIPPET_MAX)
 
   // --- Networking ---------------------------------------------------------
 
@@ -256,12 +355,13 @@ class UploadWorker(
 
   // --- Error emission -----------------------------------------------------
 
-  private fun emitSyncError(message: String, status: Int?, dao: PointDao) {
+  private fun emitSyncError(message: String, status: Int?, dao: PointDao, droppedCount: Int? = null) {
     val bufferedCount = runCatching { dao.count() }.getOrDefault(-1)
     val payload = Bundle().apply {
       putString("message", message)
       status?.let { putInt("status", it) }
       putInt("bufferedCount", bufferedCount)
+      droppedCount?.let { putInt("droppedCount", it) }
     }
     // Best-effort: dropped if no JS module is attached (data is still buffered).
     runCatching { LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_SYNC_ERROR, payload) }
@@ -270,6 +370,27 @@ class UploadWorker(
   companion object {
     private const val PREFS = "livetrack_prefs"
     private const val TIMEOUT_MS = 30_000
+
+    /**
+     * Attempts a row may sit unacknowledged under repeated 2xx responses before it
+     * is evicted. See `PointEntity.attempts`.
+     *
+     * Attempts increment ONLY on "server returned 2xx and named none of your rows"
+     * — network errors, 4xx and 5xx keep their retry()/failure() paths and never
+     * touch the counter. Combined with the Result.retry() backoff below, the 15-min
+     * periodic flush becomes the dominant driver, putting 15 attempts at roughly
+     * 3-4 hours of continuously-confirmed refusal — while the diagnostic fires on
+     * attempt #1. Overridable via `cadence.maxUploadAttempts`.
+     */
+    const val DEFAULT_MAX_UPLOAD_ATTEMPTS = 15
+
+    /** Conservative bound for `IN (:ids)`: SQLITE_MAX_VARIABLE_NUMBER is 999 pre-3.32. */
+    private const val SQL_VAR_CHUNK = 500
+
+    /** Keeps a diagnostic body snippet under the crash reporter's per-key limit. */
+    private const val BODY_SNIPPET_MAX = 300
+
+    private val WHITESPACE = Regex("\\s+")
 
     /** Reflectively-loaded token provider, cached process-wide. */
     @Volatile

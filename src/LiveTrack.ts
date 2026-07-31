@@ -20,6 +20,7 @@ const DEFAULT_CADENCE: Required<Cadence> = {
   stillIntervalMs: 120000,
   batchSize: 50,
   maxAccuracyM: 50,
+  maxUploadAttempts: 15,
 };
 
 /**

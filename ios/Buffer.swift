@@ -31,6 +31,9 @@ final class Buffer {
     let act: String?
     let mock: Bool
     let eventType: String?
+    /// Upload attempts where this row was SENT and the server answered 2xx without
+    /// acknowledging its id. Mirrors Android's `PointEntity.attempts`.
+    let attempts: Int
   }
 
   static let shared = Buffer()
@@ -93,11 +96,36 @@ final class Buffer {
         charging INTEGER,
         act TEXT,
         mock INTEGER,
-        eventType TEXT
+        eventType TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0
       );
       """
     // VERIFY: sqlite3_exec signature (db, sql, callback, arg, errmsg).
     sqlite3_exec(db, createSQL, nil, nil, nil)
+
+    // v1 -> v2, mirroring Room's MIGRATION_1_2. Additive only, so every un-uploaded
+    // row survives the app update. Guarded by a column probe rather than by firing
+    // the ALTER and swallowing sqlite's "duplicate column name" error, so it is a
+    // clean no-op both on an already-migrated DB and on a fresh install (where the
+    // CREATE above already added the column).
+    if !hasColumn("attempts", in: "points") {
+      sqlite3_exec(db, "ALTER TABLE points ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;", nil, nil, nil)
+    }
+  }
+
+  /// MUST be called on `queue`. // VERIFY: PRAGMA table_info column 1 is the name.
+  private func hasColumn(_ column: String, in table: String) -> Bool {
+    guard let db = db else { return false }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else {
+      sqlite3_finalize(stmt)
+      return false
+    }
+    defer { sqlite3_finalize(stmt) }
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      if let name = sqlite3_column_text(stmt, 1), String(cString: name) == column { return true }
+    }
+    return false
   }
 
   // MARK: - Inserts
@@ -202,7 +230,7 @@ final class Buffer {
     return queue.sync {
       guard let db = db else { return [] }
       var rows: [Row] = []
-      let sql = "SELECT id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, eventType FROM points ORDER BY t ASC, id ASC LIMIT ?;"
+      let sql = "SELECT id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, eventType, attempts FROM points ORDER BY t ASC, id ASC LIMIT ?;"
       var stmt: OpaquePointer?
       guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
         sqlite3_finalize(stmt)
@@ -233,9 +261,11 @@ final class Buffer {
     let act = columnText(stmt, 9)
     let mock = sqlite3_column_int(stmt, 10) != 0
     let eventType = columnText(stmt, 11)
+    let attempts = Int(sqlite3_column_int(stmt, 12))
     return Row(
       id: id, userId: userId, t: t, lat: lat, lng: lng, speed: speed, acc: acc,
-      batt: batt, charging: charging, act: act, mock: mock, eventType: eventType
+      batt: batt, charging: charging, act: act, mock: mock, eventType: eventType,
+      attempts: attempts
     )
   }
 
@@ -268,26 +298,99 @@ final class Buffer {
     }
   }
 
-  // MARK: - Deletes
+  // MARK: - Deletes and retry accounting
+
+  /// Conservative bound for a parameterised `IN (...)` list: SQLITE_MAX_VARIABLE_NUMBER
+  /// is 999 on older sqlite builds and `batchSize` is host-supplied.
+  private static let sqlVarChunk = 500
 
   /// Delete rows by id (called after a server ACK). Runs synchronously.
   func deleteByIds(_ ids: [Int64]) {
+    runChunked(ids) { "DELETE FROM points WHERE id IN (\($0));" }
+  }
+
+  /// Bump the retry counter for rows the server received under a 2xx but did not
+  /// acknowledge. Mirrors Android's `PointDao.incrementAttempts`.
+  func incrementAttempts(_ ids: [Int64]) {
+    runChunked(ids) { "UPDATE points SET attempts = attempts + 1 WHERE id IN (\($0));" }
+  }
+
+  /// Runs `sqlBuilder` once per chunk of at most `sqlVarChunk` ids, passing the
+  /// placeholder list. Keeps every `IN (...)` statement under the variable limit.
+  private func runChunked(_ ids: [Int64], _ sqlBuilder: (String) -> String) {
     guard !ids.isEmpty else { return }
     queue.sync {
       guard let db = db else { return }
-      // Build a parameterised IN (...) list to avoid SQL injection / quoting issues.
-      let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-      let sql = "DELETE FROM points WHERE id IN (\(placeholders));"
+      for start in stride(from: 0, to: ids.count, by: Buffer.sqlVarChunk) {
+        let chunk = Array(ids[start..<min(start + Buffer.sqlVarChunk, ids.count)])
+        // Parameterised IN (...) list — avoids SQL injection / quoting issues.
+        let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sqlBuilder(placeholders), -1, &stmt, nil) == SQLITE_OK else {
+          sqlite3_finalize(stmt)
+          continue
+        }
+        for (i, id) in chunk.enumerated() {
+          sqlite3_bind_int64(stmt, Int32(i + 1), id)
+        }
+        sqlite3_step(stmt)
+        sqlite3_finalize(stmt)
+      }
+    }
+  }
+
+  /// Sample of rows that have exhausted their attempts — for the eviction diagnostic.
+  func idsExceedingAttempts(_ max: Int, limit: Int) -> [Int64] {
+    return queue.sync {
+      guard let db = db else { return [] }
+      var out: [Int64] = []
+      let sql = "SELECT id FROM points WHERE attempts >= ? ORDER BY t ASC, id ASC LIMIT ?;"
       var stmt: OpaquePointer?
       guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
         sqlite3_finalize(stmt)
-        return
+        return []
       }
       defer { sqlite3_finalize(stmt) }
-      for (i, id) in ids.enumerated() {
-        sqlite3_bind_int64(stmt, Int32(i + 1), id)
+      sqlite3_bind_int(stmt, 1, Int32(max))
+      sqlite3_bind_int(stmt, 2, Int32(limit))
+      while sqlite3_step(stmt) == SQLITE_ROW {
+        out.append(sqlite3_column_int64(stmt, 0))
       }
+      return out
+    }
+  }
+
+  /// Oldest timestamp among exhausted rows (diagnostic context). Nil when none.
+  func oldestExceedingAttempts(_ max: Int) -> Int64? {
+    return queue.sync {
+      guard let db = db else { return nil }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "SELECT MIN(t) FROM points WHERE attempts >= ?;", -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return nil
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_int(stmt, 1, Int32(max))
+      guard sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+      return sqlite3_column_int64(stmt, 0)
+    }
+  }
+
+  /// Evict rows that have exhausted their attempts. Returns the number deleted.
+  @discardableResult
+  func deleteExceedingAttempts(_ max: Int) -> Int {
+    return queue.sync {
+      guard let db = db else { return 0 }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "DELETE FROM points WHERE attempts >= ?;", -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return 0
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_int(stmt, 1, Int32(max))
       sqlite3_step(stmt)
+      // VERIFY: sqlite3_changes reports rows affected by the most recent statement.
+      return Int(sqlite3_changes(db))
     }
   }
 }

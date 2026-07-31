@@ -21,14 +21,18 @@ class BufferDbPreservationTest {
     ctx.deleteDatabase(name)
 
     // First open: seed two rows, then close.
-    var db = Room.databaseBuilder(ctx, BufferDb::class.java, name).build()
+    var db = Room.databaseBuilder(ctx, BufferDb::class.java, name)
+      .allowMainThreadQueries() // test-only: lets us call the synchronous DAO inline.
+      .build()
     db.pointDao().insert(PointEntity(userId = "u1", t = 1, lat = 1.0, lng = 2.0))
     db.pointDao().insert(PointEntity(userId = "u1", t = 2, eventType = "HEARTBEAT"))
     assertEquals(2, db.pointDao().count())
     db.close()
 
     // Reopen with the same configuration: rows must survive.
-    db = Room.databaseBuilder(ctx, BufferDb::class.java, name).build()
+    db = Room.databaseBuilder(ctx, BufferDb::class.java, name)
+      .allowMainThreadQueries() // test-only: lets us call the synchronous DAO inline.
+      .build()
     assertEquals(2, db.pointDao().count())
     db.close()
     ctx.deleteDatabase(name)

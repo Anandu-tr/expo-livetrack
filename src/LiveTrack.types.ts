@@ -11,8 +11,18 @@ export interface Cadence {
   movingIntervalMs?: number; // default 12000
   movingDistanceM?: number; // default 30
   stillIntervalMs?: number; // default 120000
-  batchSize?: number; // default 50
+  batchSize?: number; // default 50, clamped to 1..500 natively (SQL variable limit)
   maxAccuracyM?: number; // default 50
+  /**
+   * How many times a row may be sent and come back unacknowledged under an HTTP
+   * 2xx before it is dropped from the buffer and reported. Default 15.
+   *
+   * Only "server answered 2xx and named none of your rows" counts — network
+   * errors, 4xx and 5xx are retried losslessly and never consume the budget. This
+   * bounds what would otherwise be an infinite re-upload loop against a server
+   * whose ack format the client cannot read.
+   */
+  maxUploadAttempts?: number; // default 15
 }
 
 /** Opt-in operational diagnostics. `crashlytics` routes native upload/SQL failures to Crashlytics. */
@@ -69,6 +79,11 @@ export interface SyncError {
   message: string;
   status?: number;
   bufferedCount?: number;
+  /**
+   * Present only when rows were evicted after exhausting `maxUploadAttempts`.
+   * Non-zero means buffered data was dropped without a server ACK.
+   */
+  droppedCount?: number;
 }
 
 /**

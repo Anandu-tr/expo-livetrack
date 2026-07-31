@@ -56,7 +56,15 @@ public class LiveTrackModule: Module {
       let movingDistanceM = LiveTrackModule.num(cadence["movingDistanceM"], 30)
       let stillIntervalMs = LiveTrackModule.num(cadence["stillIntervalMs"], 120_000)
       let maxAccuracyM = LiveTrackModule.num(cadence["maxAccuracyM"], 50)
-      let batchSize = Int(LiveTrackModule.num(cadence["batchSize"], 50))
+      // Clamped to the uploader's SQL-variable budget: deleteByIds/incrementAttempts
+      // bind one variable per id and SQLITE_MAX_VARIABLE_NUMBER is 999 on older sqlite.
+      let batchSize = min(max(Int(LiveTrackModule.num(cadence["batchSize"], 50)), 1), 500)
+      let maxUploadAttempts = max(
+        Int(LiveTrackModule.num(
+          cadence["maxUploadAttempts"], Double(Uploader.defaultMaxUploadAttempts)
+        )),
+        1
+      )
 
       let cfg = TrackingConfig(
         url: url,
@@ -66,7 +74,8 @@ public class LiveTrackModule: Module {
         movingDistanceM: movingDistanceM,
         stillIntervalMs: stillIntervalMs,
         batchSize: batchSize,
-        maxAccuracyM: maxAccuracyM
+        maxAccuracyM: maxAccuracyM,
+        maxUploadAttempts: maxUploadAttempts
       )
       TrackingManager.shared.start(config: cfg)
     }

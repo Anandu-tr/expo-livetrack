@@ -1,5 +1,6 @@
 package expo.modules.livetrack.buffer
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
@@ -13,6 +14,10 @@ import androidx.room.PrimaryKey
  *
  * Rows are deleted on server ACK (see [PointDao.deleteByIds]); there is no
  * `synced` column by design — the buffer only ever holds un-uploaded rows.
+ *
+ * The one exception to "ACK or keep forever" is [attempts]: a row the server
+ * repeatedly refuses to acknowledge is eventually evicted, because the alternative
+ * (observed in production) is a device re-uploading the same batch indefinitely.
  *
  * NOTE: `acc` defaults to -1.0 (not null) so an "unknown accuracy" is still a
  * concrete sentinel; the capture path ALWAYS writes the real `location.accuracy`,
@@ -32,4 +37,16 @@ data class PointEntity(
   val act: String? = null,
   val mock: Boolean = false,
   val eventType: String? = null,
+  /**
+   * Upload attempts where this row was SENT and the server answered 2xx without
+   * acknowledging its id. Bumped on that exact signal only — never on network
+   * errors, 4xx or 5xx, which are retried losslessly. At
+   * `UploadWorker.DEFAULT_MAX_UPLOAD_ATTEMPTS` the row is evicted and reported,
+   * which is what makes an infinite re-upload loop impossible.
+   *
+   * `defaultValue` is required, not cosmetic: Room validates the migrated
+   * TableInfo against this entity, so the fresh-install CREATE TABLE must match
+   * what `MIGRATION_1_2`'s ALTER TABLE produces.
+   */
+  @ColumnInfo(defaultValue = "0") val attempts: Int = 0,
 )

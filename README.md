@@ -115,8 +115,9 @@ interface Cadence {
   movingIntervalMs?: number; // default 12000
   movingDistanceM?: number;  // default 30
   stillIntervalMs?: number;  // default 120000
-  batchSize?: number;        // default 50
+  batchSize?: number;        // default 50 (clamped natively to 1..500)
   maxAccuracyM?: number;     // default 50
+  maxUploadAttempts?: number; // default 15 — see "Wire contract" below
 }
 ```
 
@@ -165,6 +166,7 @@ interface SyncError {
   message: string;
   status?: number;
   bufferedCount?: number;
+  droppedCount?: number; // rows evicted after exhausting maxUploadAttempts
 }
 ```
 
@@ -194,7 +196,7 @@ fields above.
 }
 ```
 
-**Response (HTTP 200):**
+**Response (any HTTP 2xx):**
 
 ```json
 { "acceptedIds": ["uuid-1", "uuid-2"] }
@@ -204,6 +206,32 @@ fields above.
 `acceptedIds`, and **retries the rest** on the next batch. This is what guarantees
 no point is lost across network failures or process death. The server is expected
 to dedupe (e.g. by `(u, t)`) so retried records don't create duplicates.
+
+Ids you return are **intersected with the ids the client sent**. Returning your own
+primary keys instead of echoing the client's `id` acknowledges nothing, and the
+batch will be retried.
+
+**Tolerated response variants.** The shape above is the contract, but the parser
+also accepts these so a non-conforming backend degrades instead of stalling:
+
+| Variant | Example |
+| --- | --- |
+| Numeric ids | `{"acceptedIds": [1043, 1044]}` |
+| Envelope | `{"success": true, "data": {"acceptedIds": [...]}}` (also `result`) |
+| Field aliases | `acceptedIDs`, `accepted`, `ids` |
+| Objects | `{"acceptedIds": [{"id": "1043"}]}` (also `rowId`, `clientId`) |
+| Bare array | `["1043", "1044"]` |
+
+**If the client cannot read your acknowledgement** — an empty body, an unknown
+shape, or ids that were never sent — it does **not** treat the 2xx as success. It
+reports a `upload-ack-empty` / `upload-ack-foreign` diagnostic (including a
+truncated response snippet, so the actual shape is visible in your crash reporter),
+backs off, and increments a per-row attempt counter. After `maxUploadAttempts`
+(default 15) the affected rows are dropped and a `buffer-evicted` diagnostic plus an
+`onSyncError` with `droppedCount` are emitted.
+
+This bound exists because the alternative is worse: without it a single unreadable
+ack makes the device re-upload the same batch indefinitely.
 
 ## App-controlled enable-location pattern
 

@@ -20,6 +20,12 @@ object Prefs {
   const val KEY_MAX_ACCURACY_M = "maxAccuracyM"
   const val KEY_BATCH_SIZE = "batchSize"
 
+  /**
+   * Times a row may be sent and come back unacknowledged under a 2xx before the
+   * uploader evicts it. Bounds the re-upload loop; see `PointEntity.attempts`.
+   */
+  const val KEY_MAX_UPLOAD_ATTEMPTS = "maxUploadAttempts"
+
   // Token provider: fully-qualified class name of a native TokenProvider impl the
   // uploader loads (reflection) to mint fresh tokens without the app's JS running.
   const val KEY_TOKEN_PROVIDER_CLASS = "tokenProviderClass"

@@ -11,13 +11,13 @@ plugins {
 apply plugin: 'kotlin-kapt'
 
 group = 'expo.modules.livetrack'
-version = '0.1.0'
+version = '0.2.0'
 
 android {
   namespace "expo.modules.livetrack"
   defaultConfig {
-    versionCode 1
-    versionName "0.1.0"
+    versionCode 2
+    versionName "0.2.0"
   }
   lintOptions {
     abortOnError false
