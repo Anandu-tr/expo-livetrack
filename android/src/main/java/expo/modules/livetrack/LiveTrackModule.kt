@@ -229,11 +229,42 @@ class LiveTrackModule : Module() {
     // foreground service isn't killed in Doze/standby. The package shows NO popup
     // of its own — this only fires the OS dialog when the host app calls it. OEM
     // autostart deep-links are handled on the JS side via expo-intent-launcher.
+    //
+    // Throttled and capped (state persisted in Prefs, so it survives force-stop /
+    // relaunch): at most one OS dialog per ENSURE_NOT_KILLED_COOLDOWN_MS, and at
+    // most ENSURE_NOT_KILLED_MAX_ATTEMPTS consecutive attempts before giving up
+    // silently. Needed because on some OEMs (e.g. MIUI-style battery managers)
+    // isBatteryOptIgnored() doesn't reliably reflect a just-granted exemption, so
+    // an unthrottled caller re-launches this dialog on every foreground transition
+    // — including the one caused by returning FROM the dialog's own settings
+    // screen — producing an unbreakable prompt loop. The host app's own
+    // "Background Usage Restricted" banner (LocationContext.tsx, throttled
+    // separately) is the fallback once we give up here.
     AsyncFunction("ensureNotKilled") { promise: Promise ->
       runCatching {
         val ctx = context
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (isBatteryOptIgnored(ctx)) {
-          // Already exempt — nothing to ask.
+          // Already exempt — nothing to ask. Reset so a later re-optimization
+          // (user re-enables it manually, later in Android Settings) gets a
+          // fresh set of attempts rather than staying capped forever.
+          prefs.edit().putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, 0).apply()
+          promise.resolve(null)
+          return@runCatching
+        }
+        val attempts = prefs.getInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, 0)
+        if (attempts >= ENSURE_NOT_KILLED_MAX_ATTEMPTS) {
+          // Given up for this exemption cycle — avoids an unbreakable loop on
+          // devices where the OS never reflects the grant. The in-app banner is
+          // the remaining fallback; nothing else to do here.
+          promise.resolve(null)
+          return@runCatching
+        }
+        val lastAttemptAt = prefs.getLong(Prefs.KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT, 0L)
+        val now = System.currentTimeMillis()
+        if (now - lastAttemptAt < ENSURE_NOT_KILLED_COOLDOWN_MS) {
+          // Too soon since the last prompt — most commonly the foreground
+          // transition caused by returning from the settings screen itself.
           promise.resolve(null)
           return@runCatching
         }
@@ -254,6 +285,10 @@ class LiveTrackModule : Module() {
           intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
           ctx.startActivity(intent)
         }
+        prefs.edit()
+          .putLong(Prefs.KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT, now)
+          .putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, attempts + 1)
+          .apply()
         // We can't await the dialog result here (no result contract); resolve once
         // launched. The host re-reads getState().batteryOptIgnored afterwards.
         promise.resolve(null)
@@ -431,5 +466,9 @@ class LiveTrackModule : Module() {
   companion object {
     private const val PREFS = "livetrack_prefs"
     private const val REQ_ENABLE_LOCATION = 3003
+    /** ensureNotKilled() throttle: matches the app's own in-app banner cadence. */
+    private const val ENSURE_NOT_KILLED_COOLDOWN_MS = 10 * 60 * 1000L
+    /** ensureNotKilled() cap: consecutive un-confirmed attempts before giving up. */
+    private const val ENSURE_NOT_KILLED_MAX_ATTEMPTS = 3
   }
 }

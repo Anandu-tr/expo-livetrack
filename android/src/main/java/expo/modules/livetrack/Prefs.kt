@@ -44,4 +44,13 @@ object Prefs {
 
   /** Last seen battery-optimization-ignored state, for BATTERY_OPT_ON deltas. */
   const val KEY_LAST_BATTERY_OPT_IGNORED = "lastBatteryOptIgnored"
+
+  /**
+   * ensureNotKilled() throttle state: last time the raw OS "ignore battery
+   * optimization" dialog (ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) was
+   * launched, and how many consecutive attempts have gone by without the OS
+   * confirming the exemption. See LiveTrackModule.ensureNotKilled.
+   */
+  const val KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT = "ensureNotKilledLastAttemptAt"
+  const val KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT = "ensureNotKilledAttemptCount"
 }
