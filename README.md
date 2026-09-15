@@ -92,7 +92,7 @@ import { LiveTracker } from 'expo-livetrack';
 | `stop()` | `Promise<void>` | Stop tracking and the foreground service. |
 | `getState()` | `Promise<TrackerState>` | Current tracker state (see below). |
 | `requestPermissions()` | `Promise<TrackerState>` | Request location permissions; resolves with the updated state. |
-| `ensureNotKilled()` | `Promise<void>` | Re-arm the service if the OS killed it; nudge the user about battery optimisation if needed. |
+| `ensureNotKilled()` | `Promise<void>` | Re-arm the service if the OS killed it; nudge the user about battery optimisation if needed. Throttled (max once per 10 min) and capped (max 3 consecutive attempts) to prevent prompt loops on devices where the OS doesn't reliably reflect the grant. |
 | `requestEnableLocation()` | `Promise<boolean>` | Ask the OS to enable location services. Resolves `true` if they end up enabled. Call this from **your own** `LOCATION_OFF` handler. |
 | `onLocation(cb)` | `EventSubscription` | Subscribe to per-record location fixes. |
 | `onEvent(cb)` | `EventSubscription` | Subscribe to lifecycle/diagnostic events. |

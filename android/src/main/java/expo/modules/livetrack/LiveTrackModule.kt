@@ -248,7 +248,10 @@ class LiveTrackModule : Module() {
           // Already exempt — nothing to ask. Reset so a later re-optimization
           // (user re-enables it manually, later in Android Settings) gets a
           // fresh set of attempts rather than staying capped forever.
-          prefs.edit().putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, 0).apply()
+          prefs.edit()
+            .putLong(Prefs.KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT, 0L)
+            .putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, 0)
+            .apply()
           promise.resolve(null)
           return@runCatching
         }
@@ -268,6 +271,13 @@ class LiveTrackModule : Module() {
           promise.resolve(null)
           return@runCatching
         }
+        // Record the attempt before launching the dialog so that even if the launch
+        // throws (ActivityNotFoundException on some OEMs, etc), the throttle/cap still
+        // engages on the next call — otherwise a throwing device retries forever unthrottled.
+        prefs.edit()
+          .putLong(Prefs.KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT, now)
+          .putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, attempts + 1)
+          .apply()
         // VERIFY: appContext.currentActivity nullable getter on this expo-modules-core.
         val activity = appContext.currentActivity
         // ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS must target a package and
@@ -285,10 +295,6 @@ class LiveTrackModule : Module() {
           intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
           ctx.startActivity(intent)
         }
-        prefs.edit()
-          .putLong(Prefs.KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT, now)
-          .putInt(Prefs.KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT, attempts + 1)
-          .apply()
         // We can't await the dialog result here (no result contract); resolve once
         // launched. The host re-reads getState().batteryOptIgnored afterwards.
         promise.resolve(null)
