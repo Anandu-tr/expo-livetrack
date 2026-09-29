@@ -14,9 +14,15 @@ object LiveTrackServiceController {
   /** Whether the foreground capture service is currently running. */
   fun isRunning(): Boolean = TrackingService.isRunning
 
-  /** Build a start intent for [TrackingService] from persisted prefs. */
-  fun buildStartIntent(context: Context, prefs: SharedPreferences): Intent {
+  /**
+   * Build a start intent for [TrackingService] from persisted prefs.
+   *
+   * @param reason why the service is being (re)started — surfaces in the
+   *   SERVICE_STARTED lifecycle event so kills and restarts become observable.
+   */
+  fun buildStartIntent(context: Context, prefs: SharedPreferences, reason: String): Intent {
     return Intent(context, TrackingService::class.java).apply {
+      putExtra(TrackingService.EXTRA_START_REASON, reason)
       putExtra(TrackingService.EXTRA_URL, prefs.getString(Prefs.KEY_URL, "") ?: "")
       putExtra(TrackingService.EXTRA_TOKEN, prefs.getString(Prefs.KEY_TOKEN, "") ?: "")
       putExtra(TrackingService.EXTRA_USER_ID, prefs.getString(Prefs.KEY_USER_ID, "") ?: "")

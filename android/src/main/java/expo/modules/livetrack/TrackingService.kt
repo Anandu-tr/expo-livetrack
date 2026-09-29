@@ -13,8 +13,11 @@ import android.location.Location
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.google.android.gms.location.ActivityRecognition
@@ -32,11 +35,13 @@ import com.google.android.gms.location.Priority
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
+import expo.modules.livetrack.capture.LocationGate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * Foreground service that captures locations into the Room buffer.
@@ -73,14 +78,28 @@ class TrackingService : Service() {
   private var movingDistanceM: Float = 30f
   private var stillIntervalMs: Long = 120_000L
   private var maxAccuracyM: Double = 50.0
+  private var lifecycleEventsOn: Boolean = false
+
+  // Noise gate; rebuilt on every (re)start so a fresh start() resets the anchor.
+  private var gate: LocationGate<PointEntity>? = null
 
   // Motion state.
   @Volatile private var isStill: Boolean = false
   @Volatile private var currentActivity: String = "UNKNOWN"
-  // Last known position, used to give HEARTBEAT rows context.
+  // Last ACCEPTED position, used to give HEARTBEAT / lifecycle rows context.
   @Volatile private var lastLat: Double? = null
   @Volatile private var lastLng: Double? = null
   private var lastHeartbeatAt: Long = 0L
+
+  // Periodic proof-of-life while still (the location callback is quiet then).
+  private val heartbeatHandler = Handler(Looper.getMainLooper())
+  private val heartbeatTick = object : Runnable {
+    override fun run() {
+      if (!isStill || !isRunning) return
+      emitHeartbeat()
+      heartbeatHandler.postDelayed(this, stillIntervalMs)
+    }
+  }
 
   private var activityPendingIntent: PendingIntent? = null
   private var activitySamplePendingIntent: PendingIntent? = null
@@ -91,7 +110,9 @@ class TrackingService : Service() {
 
   private val locationCallback = object : LocationCallback() {
     override fun onLocationResult(result: LocationResult) {
-      for (loc in result.locations) {
+      // Fused can deliver a small batch; its order is not guaranteed to be by
+      // fix time, and the gate rejects anything older than the last accepted fix.
+      for (loc in result.locations.sortedBy { it.time }) {
         handleLocation(loc)
       }
     }
@@ -118,8 +139,16 @@ class TrackingService : Service() {
       return START_STICKY
     }
 
-    // Normal start: read config + go foreground.
-    intent?.let { readConfig(it) }
+    // Normal start: read config + go foreground. A START_STICKY redelivery after
+    // process death carries a null intent — config then comes from prefs, which
+    // is what `LiveTrackModule.start` persisted (previously the defaults were
+    // used and rows went out with an empty userId).
+    val reason = if (intent == null) {
+      "sticky_restart"
+    } else {
+      intent.getStringExtra(EXTRA_START_REASON) ?: "manual"
+    }
+    if (intent != null && intent.hasExtra(EXTRA_USER_ID)) readConfig(intent) else readConfigFromPrefs()
 
     // Guard against Android 14 ForegroundServiceStartNotAllowedException /
     // SecurityException (e.g. started without location permission). If we cannot
@@ -135,15 +164,28 @@ class TrackingService : Service() {
     startLocationUpdates()
     requestActivityUpdates()
     registerProviderReceiver()
+    bufferLifecycleEvent("SERVICE_STARTED", reason)
 
     return START_STICKY
   }
 
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    // Swipe-from-recents. The foreground service normally survives this; the
+    // row makes it visible when it does not.
+    bufferLifecycleEvent("SERVICE_STOPPED", "task_removed")
+    super.onTaskRemoved(rootIntent)
+  }
+
   override fun onDestroy() {
     isRunning = false
+    heartbeatHandler.removeCallbacks(heartbeatTick)
     runCatching { fused.removeLocationUpdates(locationCallback) }
     removeActivityUpdates()
     unregisterProviderReceiver()
+    // Blocking on purpose: the coroutine scope is cancelled right after, and the
+    // held fix + stop marker must land in SQLite before the process goes away.
+    flushGate(blocking = true)
+    bufferLifecycleEvent("SERVICE_STOPPED", "destroy", blocking = true)
     scope.cancel()
     super.onDestroy()
   }
@@ -169,7 +211,32 @@ class TrackingService : Service() {
     stillIntervalMs = intent.getLongExtra(EXTRA_STILL_INTERVAL_MS, stillIntervalMs)
     maxAccuracyM = intent.getDoubleExtra(EXTRA_MAX_ACCURACY_M, maxAccuracyM)
     // url/token are persisted in prefs by the module for the uploader; not needed here.
+    onConfigLoaded()
   }
+
+  private fun readConfigFromPrefs() {
+    val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+    userId = prefs.getString(Prefs.KEY_USER_ID, userId) ?: userId
+    movingIntervalMs = prefs.getLong(Prefs.KEY_MOVING_INTERVAL_MS, movingIntervalMs)
+    movingDistanceM = prefs.getFloat(Prefs.KEY_MOVING_DISTANCE_M, movingDistanceM)
+    stillIntervalMs = prefs.getLong(Prefs.KEY_STILL_INTERVAL_MS, stillIntervalMs)
+    maxAccuracyM = prefs.getFloat(Prefs.KEY_MAX_ACCURACY_M, maxAccuracyM.toFloat()).toDouble()
+    onConfigLoaded()
+  }
+
+  private fun onConfigLoaded() {
+    lifecycleEventsOn = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+      .getBoolean(Prefs.KEY_DIAGNOSTICS_LIFECYCLE, false)
+    // A (re)start means a fresh anchor; release anything the old gate still held.
+    flushGate()
+    gate = newGate()
+  }
+
+  private fun newGate() = LocationGate<PointEntity>(
+    movingDistanceM = movingDistanceM.toDouble(),
+    maxAccuracyM = maxAccuracyM,
+    keepaliveMs = stillIntervalMs,
+  )
 
   // --- Foreground notification -------------------------------------------
 
@@ -232,18 +299,26 @@ class TrackingService : Service() {
 
   // --- Location updates ---------------------------------------------------
 
-  private fun buildLocationRequest(intervalMs: Long): LocationRequest {
+  private fun buildLocationRequest(intervalMs: Long, still: Boolean): LocationRequest {
     // VERIFY: LocationRequest.Builder API (play-services-location 21.x). Builder
     // takes (priority, intervalMillis); min update interval/distance are setters.
+    //
+    // Still mode keeps HIGH_ACCURACY (balanced power hands back Wi-Fi/cell fixes,
+    // which are the jumpy ones) but drops the distance floor to 0: with the
+    // floor in place a genuinely stationary device never received a fix, so the
+    // still cadence never actually delivered anything and — worse — a device
+    // whose Activity Recognition was stuck in STILL while riding produced gaps
+    // of many minutes. The gate turns the 120 s trickle into keepalives, and
+    // any real displacement in it exits still mode (see [noteAccepted]).
     return LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMs)
       .setMinUpdateIntervalMillis(intervalMs)
-      .setMinUpdateDistanceMeters(movingDistanceM)
+      .setMinUpdateDistanceMeters(if (still) 0f else movingDistanceM)
       .build()
   }
 
   private fun startLocationUpdates() {
     val intervalMs = if (isStill) stillIntervalMs else movingIntervalMs
-    val request = buildLocationRequest(intervalMs)
+    val request = buildLocationRequest(intervalMs, isStill)
     try {
       // Permission is the caller's responsibility (requested via the module);
       // wrapped in try/catch so a missing-permission SecurityException can't crash
@@ -260,16 +335,17 @@ class TrackingService : Service() {
   }
 
   private fun handleLocation(loc: Location) {
-    // On-device accuracy gate: drop poor fixes at the source. The server also
-    // rejects acc > maxAccuracyM, so buffering them would make rows that are
-    // never ACKed and thus re-sent forever (unbounded buffer growth). Points
-    // with no accuracy reported are kept (downstream jitter fallback handles them).
-    if (loc.hasAccuracy() && loc.accuracy.toDouble() > maxAccuracyM) {
-      return
-    }
+    val g = gate ?: newGate().also { gate = it }
 
-    lastLat = loc.latitude
-    lastLng = loc.longitude
+    // -1 = "no accuracy reported". The gate rejects it (matches the iOS `acc < 0`
+    // rule); such fixes used to be stored as acc = 0.0, i.e. as if perfect. The
+    // gate also enforces acc <= maxAccuracyM, which the server enforces too — a
+    // buffered row the server refuses is never ACKed and re-sent forever.
+    val acc = if (loc.hasAccuracy()) loc.accuracy.toDouble() else -1.0
+    // Monotonic age: a cached fix replayed after a restart looks current by
+    // wall-clock but old by elapsedRealtime.
+    val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000L
+    val fix = LocationGate.Fix(loc.latitude, loc.longitude, acc, loc.time)
 
     val battery = readBattery()
     val mock = isMock(loc)
@@ -279,14 +355,18 @@ class TrackingService : Service() {
     // speed so `act` isn't perpetually UNKNOWN.
     val act = if (currentActivity != "UNKNOWN") currentActivity else speedActivity(loc)
 
+    // Metadata is captured at arrival and travels with the fix through the gate's
+    // one-fix hold, so a row released later still describes its own moment.
     val point = PointEntity(
       userId = userId,
-      t = System.currentTimeMillis(),
+      // Fix time, not arrival time: batched deliveries share an arrival time and
+      // produced near-identical `t` for consecutive points (seen as 100+ km/h
+      // speed spikes on a smooth 35 km/h drive).
+      t = loc.time,
       lat = loc.latitude,
       lng = loc.longitude,
-      // ALWAYS capture accuracy (fixes the production acc=null bug).
-      acc = loc.accuracy.toDouble(),
-      speed = loc.speed.toDouble(),
+      acc = acc,
+      speed = if (loc.hasSpeed()) loc.speed.toDouble() else 0.0,
       batt = battery.first,
       charging = battery.second,
       act = act,
@@ -294,6 +374,40 @@ class TrackingService : Service() {
       eventType = null,
     )
 
+    when (val out = g.evaluate(fix, ageMs, point)) {
+      is LocationGate.Outcome.Reject -> {
+        Log.d(TAG, "gate reject=${out.reason} acc=$acc age=${ageMs}ms t=${loc.time}")
+      }
+      is LocationGate.Outcome.Hold -> noteAccepted(loc, out.displacementM)
+      is LocationGate.Outcome.Release -> {
+        noteAccepted(loc, out.displacementM)
+        writePoint(out.payload)
+      }
+      is LocationGate.Outcome.Snap -> {
+        // Stationary keepalive at the anchor: proves liveness without painting
+        // the jitter blob a parked device otherwise produces.
+        writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, speed = 0.0, act = "STILL"))
+      }
+    }
+  }
+
+  /** Bookkeeping for every fix the gate accepted (held or released). */
+  private fun noteAccepted(loc: Location, displacementM: Double) {
+    lastLat = loc.latitude
+    lastLng = loc.longitude
+    // Activity Recognition can sit in STILL for an entire ride (observed: 120 s
+    // cadence over 9 km, with gaps of up to an hour). Real displacement is the
+    // ground truth, so leave still mode from here instead of waiting for AR.
+    if (isStill &&
+      (displacementM > movingDistanceM * STILL_EXIT_DISTANCE_FACTOR ||
+        (loc.hasSpeed() && loc.speed > STILL_EXIT_SPEED_MPS))
+    ) {
+      currentActivity = speedActivity(loc).takeIf { it != "STILL" } ?: "UNKNOWN"
+      onExitStill()
+    }
+  }
+
+  private fun writePoint(point: PointEntity) {
     scope.launch {
       runCatching { dao.insert(point) }.onFailure {
         reporter.recordFailure("db-write", it.message ?: "insert(location) failed", mapOf("hasLocation" to "true"))
@@ -306,13 +420,60 @@ class TrackingService : Service() {
     // Best-effort UI emission (short-key shape from LiveTrack.types.ts).
     LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_LOCATION, locationBundle(point))
 
-    if (mock) {
+    if (point.mock) {
       LiveTrackEventBus.emit(
         LiveTrackEventBus.EVENT_EVENT,
         eventBundle("MOCK_DETECTED", point.t, point.lat, point.lng, point.batt),
       )
     }
-    // TODO next task: nudge the upload worker once buffer crosses batchSize.
+  }
+
+  /**
+   * Release the fix the gate is holding for its lookahead. Called on the still
+   * transition (so the last real position is written before the keepalives
+   * start) and on destroy, where the insert must complete synchronously.
+   */
+  private fun flushGate(blocking: Boolean = false) {
+    val (_, payload) = gate?.flush() ?: return
+    if (blocking) {
+      runCatching { runBlocking(Dispatchers.IO) { dao.insert(payload) } }
+    } else {
+      writePoint(payload)
+    }
+  }
+
+  /**
+   * SERVICE_STARTED / SERVICE_STOPPED rows, opt-in via `diagnostics.lifecycleEvents`.
+   * `reason` (manual, boot, package_replaced, watchdog, sticky_restart, receiver,
+   * task_removed, destroy) rides in the `act` column and is serialised as `r`.
+   */
+  private fun bufferLifecycleEvent(type: String, reason: String, blocking: Boolean = false) {
+    if (!lifecycleEventsOn) return
+    val now = System.currentTimeMillis()
+    val batt = readBattery().first
+    val row = PointEntity(
+      userId = userId,
+      t = now,
+      lat = lastLat,
+      lng = lastLng,
+      batt = batt,
+      act = reason,
+      eventType = type,
+    )
+    if (blocking) {
+      runCatching { runBlocking(Dispatchers.IO) { dao.insert(row) } }
+    } else {
+      scope.launch {
+        runCatching { dao.insert(row) }.onFailure {
+          reporter.recordFailure("db-write", it.message ?: "insert(event) failed", mapOf("hasLocation" to "false"))
+        }
+      }
+    }
+    runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext) }
+    LiveTrackEventBus.emit(
+      LiveTrackEventBus.EVENT_EVENT,
+      eventBundle(type, now, lastLat, lastLng, batt).apply { putString("r", reason) },
+    )
   }
 
   private fun locationBundle(p: PointEntity): Bundle = Bundle().apply {
@@ -493,23 +654,28 @@ class TrackingService : Service() {
     if (isStill) return
     isStill = true
     currentActivity = "STILL"
+    // Write the fix the gate is holding first: it is the last real position
+    // before the stationary period, and nothing else would release it in time.
+    flushGate()
     restartLocationUpdates() // switch to stillIntervalMs
     emitHeartbeat() // immediate heartbeat on becoming still
+    heartbeatHandler.removeCallbacks(heartbeatTick)
+    heartbeatHandler.postDelayed(heartbeatTick, stillIntervalMs)
   }
 
   private fun onExitStill() {
     if (!isStill) return
     isStill = false
+    heartbeatHandler.removeCallbacks(heartbeatTick)
     restartLocationUpdates() // restore movingIntervalMs
   }
 
   /**
-   * Insert a HEARTBEAT event row (with last known position) while still.
+   * Insert a HEARTBEAT event row (with last accepted position) while still.
    *
-   * NOTE: This is currently fired on the still-transition. A periodic
-   * every-stillInterval heartbeat needs a timer/Handler or a self-scheduled
-   * alarm; // TODO next task: drive periodic heartbeats while STILL (the
-   * still-cadence FusedLocation callback also still fires and re-buffers).
+   * Fired on the still-transition and then every `stillIntervalMs` by
+   * [heartbeatTick] for as long as the device stays still, so a long stationary
+   * period is distinguishable from a dead service.
    */
   private fun emitHeartbeat() {
     val now = System.currentTimeMillis()
@@ -572,9 +738,16 @@ class TrackingService : Service() {
     // Minimum confidence (0-100) before we trust a sampled activity.
     private const val MIN_CONFIDENCE = 50
 
+    // A still-mode fix that moved this many `movingDistanceM`s from the anchor,
+    // or that reports at least this speed, ends still mode without waiting for AR.
+    private const val STILL_EXIT_DISTANCE_FACTOR = 2.0
+    private const val STILL_EXIT_SPEED_MPS = 1.0f
+
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
     const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"
 
+    /** Why the service was started; surfaces as the SERVICE_STARTED event's `r`. */
+    const val EXTRA_START_REASON = "startReason"
     const val EXTRA_USER_ID = "userId"
     const val EXTRA_URL = "url"
     const val EXTRA_TOKEN = "token"

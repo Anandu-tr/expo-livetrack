@@ -40,7 +40,13 @@ class BootReceiver : BroadcastReceiver() {
       return
     }
 
-    val serviceIntent = LiveTrackServiceController.buildStartIntent(context, prefs)
+    val reason = when (action) {
+      Intent.ACTION_BOOT_COMPLETED -> "boot"
+      Intent.ACTION_MY_PACKAGE_REPLACED -> "package_replaced"
+      Watchdog.ACTION_WATCHDOG -> "watchdog"
+      else -> "receiver"
+    }
+    val serviceIntent = LiveTrackServiceController.buildStartIntent(context, prefs, reason)
     runCatching {
       // VERIFY: background-start-from-receiver constraints on Android 12+/14:
       // starting a location FGS from BOOT_COMPLETED is explicitly allowed

@@ -61,14 +61,27 @@ class ProviderReceiver : BroadcastReceiver() {
       .getOrDefault(false)
 
     val prefs = context.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
-    // Debounce: only act on an actual transition. -1 = unknown (first observation).
-    val last = if (prefs.contains(Prefs.KEY_LAST_LOCATION_ENABLED)) {
-      prefs.getBoolean(Prefs.KEY_LAST_LOCATION_ENABLED, true)
-    } else {
-      null
+    // Debounce: only act on an actual transition. null = unknown (first observation).
+    //
+    // PROVIDERS_CHANGED is delivered several times per toggle (once per provider,
+    // and to both the manifest and the runtime-registered instance). Those
+    // deliveries run concurrently, and a read-compare-write on prefs raced: six
+    // identical LOCATION_OFF rows in one second were observed in production. The
+    // process-wide lock plus a synchronous commit make the check atomic.
+    val transition = synchronized(DEBOUNCE_LOCK) {
+      val last = if (prefs.contains(Prefs.KEY_LAST_LOCATION_ENABLED)) {
+        prefs.getBoolean(Prefs.KEY_LAST_LOCATION_ENABLED, true)
+      } else {
+        null
+      }
+      if (last != null && last == enabled) {
+        false
+      } else {
+        prefs.edit().putBoolean(Prefs.KEY_LAST_LOCATION_ENABLED, enabled).commit()
+        true
+      }
     }
-    if (last != null && last == enabled) return
-    prefs.edit().putBoolean(Prefs.KEY_LAST_LOCATION_ENABLED, enabled).apply()
+    if (!transition) return
 
     val userId = prefs.getString(Prefs.KEY_USER_ID, "") ?: ""
     val eventType = if (enabled) "LOCATION_ON" else "LOCATION_OFF"
@@ -133,6 +146,9 @@ class ProviderReceiver : BroadcastReceiver() {
   }
 
   companion object {
+    /** Serialises the debounce read-compare-write across concurrent deliveries. */
+    private val DEBOUNCE_LOCK = Any()
+
     /**
      * Register a runtime instance bound to [TrackingService]'s lifetime so the
      * PROVIDERS_CHANGED broadcast is reliably received even when manifest
