@@ -36,8 +36,19 @@ class LocationGate<T>(
   private val keepaliveMs: Long,
 ) {
 
-  /** Minimal view of a fix; `acc < 0` means "no accuracy reported". */
-  data class Fix(val lat: Double, val lng: Double, val acc: Double, val t: Long)
+  /**
+   * Minimal view of a fix; `acc < 0` means "no accuracy reported".
+   *
+   * @param t wall-clock fix time (`Location.time`) — carried through to
+   *   released/snapped payloads, where a real timestamp is what matters.
+   * @param monotonicT monotonic fix time (`elapsedRealtime`-based) — the ONLY
+   *   time base used for dt/anchor math below. `t` alone was tried first and
+   *   has a wedge bug: a backward wall-clock jump (NTP correction, manual
+   *   clock change, cold boot before time sync) makes every later fix look
+   *   "out-of-order" forever, since only acceptance advances the anchor and
+   *   acceptance is exactly what a negative dt blocks.
+   */
+  data class Fix(val lat: Double, val lng: Double, val acc: Double, val t: Long, val monotonicT: Long)
 
   sealed class Outcome<out T> {
     /** Dropped. `reason` is one of accuracy|stale|out-of-order|teleport|jitter|zigzag. */
@@ -65,13 +76,13 @@ class LocationGate<T>(
   /** Accepted fix awaiting the lookahead vote. */
   private var held: Held<T>? = null
 
-  /** Time base for dt. Advances on accept and on every Snap. */
-  private var anchorT: Long = 0L
+  /** Monotonic time base for dt. Advances on accept and on every Snap. */
+  private var anchorMonotonicT: Long = 0L
 
   // Re-anchor candidate for the teleport gate.
   private var cLat = 0.0
   private var cLng = 0.0
-  private var cT = 0L
+  private var cMonotonicT = 0L
   private var cCount = 0
 
   /** The fix everything is measured against: the held one if any, else the last released. */
@@ -85,11 +96,11 @@ class LocationGate<T>(
     val a = anchor
     if (a == null) {
       held = Held(fix, payload)
-      anchorT = fix.t
+      anchorMonotonicT = fix.monotonicT
       return Outcome.Hold(0.0)
     }
 
-    val dt = fix.t - anchorT
+    val dt = fix.monotonicT - anchorMonotonicT
     if (dt <= 0L) return Outcome.Reject("out-of-order")
 
     val d = haversineM(a.lat, a.lng, fix.lat, fix.lng)
@@ -99,14 +110,14 @@ class LocationGate<T>(
       // Allowed distance grows with dt, so a wrong anchor D metres away releases by
       // itself after D / MAX_SPEED_MPS seconds. The candidate counter releases it
       // sooner when several consecutive fixes agree on the new place.
-      if (cCount > 0 && fix.t > cT && haversineM(cLat, cLng, fix.lat, fix.lng) <= REANCHOR_RADIUS_M) {
+      if (cCount > 0 && fix.monotonicT > cMonotonicT && haversineM(cLat, cLng, fix.lat, fix.lng) <= REANCHOR_RADIUS_M) {
         cCount++
       } else {
         cLat = fix.lat
         cLng = fix.lng
         cCount = 1
       }
-      cT = fix.t
+      cMonotonicT = fix.monotonicT
       if (cCount >= REANCHOR_COUNT) {
         cCount = 0
         return accept(fix, payload, d)
@@ -117,7 +128,7 @@ class LocationGate<T>(
 
     if (d < max(movingDistanceM, fix.acc)) {
       if (dt >= keepaliveMs) {
-        anchorT = fix.t
+        anchorMonotonicT = fix.monotonicT
         val h = held
         if (h != null) {
           // The held real fix doubles as the keepalive.
@@ -150,17 +161,18 @@ class LocationGate<T>(
     if (h != null && prev != null && isZigZag(prev, h.fix, fix)) {
       // The held fix was a spur: prev → spur → back near prev. Drop the spur and
       // judge the new fix against prev alone. No Snap can have happened while a
-      // fix was held, so prev.t is the right time base to fall back to.
+      // fix was held, so prev's monotonic time is the right time base to fall
+      // back to.
       held = null
-      anchorT = prev.t
+      anchorMonotonicT = prev.monotonicT
       val back = haversineM(prev.lat, prev.lng, fix.lat, fix.lng)
       if (back < max(movingDistanceM, fix.acc)) return Outcome.Reject("zigzag")
       held = Held(fix, payload)
-      anchorT = fix.t
+      anchorMonotonicT = fix.monotonicT
       return Outcome.Hold(back)
     }
 
-    anchorT = fix.t
+    anchorMonotonicT = fix.monotonicT
     held = Held(fix, payload)
     if (h != null) {
       emitted = h.fix

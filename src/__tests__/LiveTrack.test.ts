@@ -7,6 +7,10 @@ jest.mock('../LiveTrackModule', () => ({
     requestPermissions: jest.fn(),
     ensureNotKilled: jest.fn(),
     requestEnableLocation: jest.fn(),
+    replay: jest.fn(),
+    getCoverage: jest.fn(),
+    clearArchive: jest.fn(),
+    getArchiveStats: jest.fn(),
     addListener: jest.fn(() => ({ remove: jest.fn() })),
   },
 }));
@@ -79,6 +83,26 @@ test('pass-through methods forward to native', async () => {
   expect(native.requestPermissions).toHaveBeenCalled();
   expect(native.ensureNotKilled).toHaveBeenCalled();
   expect(native.requestEnableLocation).toHaveBeenCalled();
+});
+
+test('start forwards archiveDays untouched', async () => {
+  await LiveTracker.start({ url: 'u', token: 't', userId: 'x', archiveDays: 45 });
+  expect((native.start as jest.Mock).mock.calls.at(-1)![0].archiveDays).toBe(45);
+});
+
+test('archive methods forward to native; getCoverage defaults gapMs to 10 minutes', async () => {
+  await LiveTracker.replay(1, 2);
+  expect(native.replay).toHaveBeenCalledWith(1, 2);
+
+  await LiveTracker.getCoverage(10, 20);
+  expect(native.getCoverage).toHaveBeenCalledWith(10, 20, 600_000);
+  await LiveTracker.getCoverage(10, 20, 5000);
+  expect(native.getCoverage).toHaveBeenCalledWith(10, 20, 5000);
+
+  await LiveTracker.clearArchive();
+  await LiveTracker.getArchiveStats();
+  expect(native.clearArchive).toHaveBeenCalled();
+  expect(native.getArchiveStats).toHaveBeenCalled();
 });
 
 test('event subscriptions forward to native addListener and return subscription', () => {

@@ -22,8 +22,14 @@ class LocationGateTest {
 
   private fun gate() = LocationGate<String>(movingDistanceM = 20.0, maxAccuracyM = 35.0, keepaliveMs = 120_000L)
 
-  private fun fix(dLatM: Double, dtS: Double, acc: Double = 10.0) =
-    Fix(lat0 + dLatM / 111_000.0, lng0, acc, t0 + (dtS * 1000).toLong())
+  private fun fix(dLatM: Double, dtS: Double, acc: Double = 10.0, monotonicDtS: Double = dtS) =
+    Fix(
+      lat0 + dLatM / 111_000.0,
+      lng0,
+      acc,
+      t0 + (dtS * 1000).toLong(),
+      t0 + (monotonicDtS * 1000).toLong(),
+    )
 
   private fun <T> LocationGate<T>.eval(f: Fix, payload: T, ageMs: Long = 0L) = evaluate(f, ageMs, payload)
 
@@ -54,6 +60,29 @@ class LocationGateTest {
     val g = gate()
     g.eval(fix(0.0, 10.0), "p1")
     assertEquals(Outcome.Reject("out-of-order"), g.eval(fix(50.0, 5.0), "p2"))
+  }
+
+  @Test fun backwardWallClockJumpDoesNotWedgeTheGate() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0), "p1")
+    // Wall clock jumps back an hour (NTP correction / cold boot before time
+    // sync) while monotonic time advances normally by 10s: a genuinely new,
+    // in-order fix must still be accepted, not rejected as "out-of-order"
+    // forever (the wedge bug: only acceptance advances the anchor).
+    val out = g.eval(fix(100.0, dtS = -3600.0, monotonicDtS = 10.0), "p2")
+    assertTrue(out is Outcome.Release)
+    assertEquals("p1", (out as Outcome.Release).payload)
+  }
+
+  @Test fun outOfOrderIsJudgedByMonotonicTimeNotWallClock() {
+    val g = gate()
+    g.eval(fix(0.0, 10.0), "p1")
+    // Wall-clock t looks later than the anchor's, but monotonic time is
+    // earlier — a real out-of-order delivery must still be rejected.
+    assertEquals(
+      Outcome.Reject("out-of-order"),
+      g.eval(fix(50.0, dtS = 20.0, monotonicDtS = 5.0), "p2"),
+    )
   }
 
   // --- normal motion -------------------------------------------------------

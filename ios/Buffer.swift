@@ -111,6 +111,28 @@ final class Buffer {
     if !hasColumn("attempts", in: "points") {
       sqlite3_exec(db, "ALTER TABLE points ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;", nil, nil, nil)
     }
+
+    // v3, mirroring Room's MIGRATION_2_3: server-acknowledged location rows kept
+    // for `archiveDays`. `id` is the ORIGINAL points.id (idempotent replay).
+    let archiveSQL = """
+      CREATE TABLE IF NOT EXISTS archived_points (
+        id INTEGER PRIMARY KEY,
+        userId TEXT NOT NULL,
+        t INTEGER NOT NULL,
+        lat REAL,
+        lng REAL,
+        speed REAL NOT NULL,
+        acc REAL NOT NULL,
+        batt INTEGER NOT NULL,
+        charging INTEGER NOT NULL,
+        act TEXT,
+        mock INTEGER NOT NULL,
+        uploadedAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_archived_points_t ON archived_points(t);
+      CREATE INDEX IF NOT EXISTS idx_archived_points_user_t ON archived_points(userId, t);
+      """
+    sqlite3_exec(db, archiveSQL, nil, nil, nil)
   }
 
   /// MUST be called on `queue`. // VERIFY: PRAGMA table_info column 1 is the name.
@@ -151,14 +173,15 @@ final class Buffer {
     }
   }
 
-  /// Insert a tier-2 event row (eventType != nil). lat/lng/batt may carry context.
-  func insertEvent(type: String, lastLat: Double?, lastLng: Double?, batt: Int) {
+  /// Insert a tier-2 event row (eventType != nil). lat/lng/batt may carry context;
+  /// `reason` (lifecycle events only) is stored in `act` and uploaded as `r`.
+  func insertEvent(type: String, lastLat: Double?, lastLng: Double?, batt: Int, reason: String? = nil) {
     let userId = TrackingConfig.load()?.userId ?? ""
     let now = Int64(Date().timeIntervalSince1970 * 1000)
     queue.sync {
       insertRow(
         userId: userId, t: now, lat: lastLat, lng: lastLng, speed: 0, acc: -1,
-        batt: batt, charging: false, act: nil, mock: false, eventType: type
+        batt: batt, charging: false, act: reason, mock: false, eventType: type
       )
     }
   }
@@ -319,24 +342,234 @@ final class Buffer {
   /// placeholder list. Keeps every `IN (...)` statement under the variable limit.
   private func runChunked(_ ids: [Int64], _ sqlBuilder: (String) -> String) {
     guard !ids.isEmpty else { return }
+    queue.sync { runChunkedLocked(ids, sqlBuilder) }
+  }
+
+  /// Same as `runChunked` but MUST already be on `queue` (the serial queue is not
+  /// re-entrant: a nested `queue.sync` deadlocks). Used inside transactions.
+  private func runChunkedLocked(_ ids: [Int64], _ sqlBuilder: (String) -> String) {
+    guard let db = db, !ids.isEmpty else { return }
+    for start in stride(from: 0, to: ids.count, by: Buffer.sqlVarChunk) {
+      let chunk = Array(ids[start..<min(start + Buffer.sqlVarChunk, ids.count)])
+      // Parameterised IN (...) list — avoids SQL injection / quoting issues.
+      let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sqlBuilder(placeholders), -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        continue
+      }
+      for (i, id) in chunk.enumerated() {
+        sqlite3_bind_int64(stmt, Int32(i + 1), id)
+      }
+      sqlite3_step(stmt)
+      sqlite3_finalize(stmt)
+    }
+  }
+
+  // MARK: - Archive (server-acknowledged location rows kept for `archiveDays`)
+
+  /// Hard ceiling on archived rows, independent of `archiveDays`. Mirrors Android.
+  static let archiveRowCap = 400_000
+
+  /// Copy location rows to the archive (when enabled) and delete them from
+  /// `points`, atomically. Mirrors Android `BufferDb.archiveAndDelete`: a crash
+  /// between the two can neither lose a row nor leave it in both tables.
+  func archiveAndDelete(rows: [Row], archive: Bool) {
+    guard !rows.isEmpty else { return }
     queue.sync {
       guard let db = db else { return }
-      for start in stride(from: 0, to: ids.count, by: Buffer.sqlVarChunk) {
-        let chunk = Array(ids[start..<min(start + Buffer.sqlVarChunk, ids.count)])
-        // Parameterised IN (...) list — avoids SQL injection / quoting issues.
-        let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+      sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
+      var ok = true
+      if archive {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let sql = """
+          INSERT OR IGNORE INTO archived_points
+            (id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, uploadedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sqlBuilder(placeholders), -1, &stmt, nil) == SQLITE_OK else {
-          sqlite3_finalize(stmt)
-          continue
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+          for r in rows where r.eventType == nil {
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            sqlite3_bind_int64(stmt, 1, r.id)
+            sqlite3_bind_text(stmt, 2, r.userId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(stmt, 3, r.t)
+            bindOptionalDouble(stmt, 4, r.lat)
+            bindOptionalDouble(stmt, 5, r.lng)
+            sqlite3_bind_double(stmt, 6, r.speed)
+            sqlite3_bind_double(stmt, 7, r.acc)
+            sqlite3_bind_int(stmt, 8, Int32(r.batt))
+            sqlite3_bind_int(stmt, 9, r.charging ? 1 : 0)
+            bindOptionalText(stmt, 10, r.act)
+            sqlite3_bind_int(stmt, 11, r.mock ? 1 : 0)
+            sqlite3_bind_int64(stmt, 12, now)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+              ok = false
+              break
+            }
+          }
+        } else {
+          ok = false
         }
-        for (i, id) in chunk.enumerated() {
-          sqlite3_bind_int64(stmt, Int32(i + 1), id)
-        }
-        sqlite3_step(stmt)
         sqlite3_finalize(stmt)
       }
+      if ok {
+        runChunkedLocked(rows.map { $0.id }) { "DELETE FROM points WHERE id IN (\($0));" }
+      }
+      sqlite3_exec(db, ok ? "COMMIT;" : "ROLLBACK;", nil, nil, nil)
     }
+  }
+
+  /// Archived rows for one user in `[from, to)`, oldest first. `eventType`/`attempts`
+  /// are selected as constants so `readRow` is reused unchanged.
+  func archivedInRange(userId: String, from: Int64, to: Int64) -> [Row] {
+    let sql = "SELECT id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, NULL, 0 " +
+      "FROM archived_points WHERE userId = ? AND t >= ? AND t < ? ORDER BY t ASC, id ASC;"
+    return rowsInRange(sql: sql, userId: userId, from: from, to: to)
+  }
+
+  /// Still-unsynced location rows for one user in `[from, to)` (coverage union).
+  func locationsInRange(userId: String, from: Int64, to: Int64) -> [Row] {
+    let sql = "SELECT id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, eventType, attempts " +
+      "FROM points WHERE userId = ? AND eventType IS NULL AND lat IS NOT NULL AND t >= ? AND t < ? " +
+      "ORDER BY t ASC, id ASC;"
+    return rowsInRange(sql: sql, userId: userId, from: from, to: to)
+  }
+
+  /// Rows for one user with id > sinceId, oldest first, capped at `limit` — export
+  /// cursor for the TEMPORARY Supabase diagnostics upload (trackingLog.ts). `id` is
+  /// the original points.id, monotonically increasing, so this never re-returns a
+  /// row already exported without re-querying from an older cursor. Can't reuse
+  /// `rowsInRange` (bind shape differs: text/int64/int, LIMIT instead of a range).
+  func archivedAfterId(userId: String, sinceId: Int64, limit: Int) -> [Row] {
+    let sql = "SELECT id, userId, t, lat, lng, speed, acc, batt, charging, act, mock, NULL, 0 " +
+      "FROM archived_points WHERE userId = ? AND id > ? ORDER BY id ASC LIMIT ?;"
+    return queue.sync {
+      guard let db = db else { return [] }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return []
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, userId, -1, SQLITE_TRANSIENT)
+      sqlite3_bind_int64(stmt, 2, sinceId)
+      sqlite3_bind_int(stmt, 3, Int32(limit))
+      var rows: [Row] = []
+      while sqlite3_step(stmt) == SQLITE_ROW {
+        rows.append(readRow(stmt))
+      }
+      return rows
+    }
+  }
+
+  private func rowsInRange(sql: String, userId: String, from: Int64, to: Int64) -> [Row] {
+    return queue.sync {
+      guard let db = db else { return [] }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return []
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, userId, -1, SQLITE_TRANSIENT)
+      sqlite3_bind_int64(stmt, 2, from)
+      sqlite3_bind_int64(stmt, 3, to)
+      var rows: [Row] = []
+      while sqlite3_step(stmt) == SQLITE_ROW {
+        rows.append(readRow(stmt))
+      }
+      return rows
+    }
+  }
+
+  /// Drop archived rows older than `cutoff`. Returns rows deleted.
+  @discardableResult
+  func pruneArchive(before cutoff: Int64) -> Int {
+    return queue.sync {
+      guard let db = db else { return 0 }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "DELETE FROM archived_points WHERE t < ?;", -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return 0
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_int64(stmt, 1, cutoff)
+      sqlite3_step(stmt)
+      return Int(sqlite3_changes(db))
+    }
+  }
+
+  /// Drop the oldest archived rows until at most `cap` remain. Returns rows dropped.
+  @discardableResult
+  func trimArchive(cap: Int) -> Int {
+    let over = archiveCount() - cap
+    guard over > 0 else { return 0 }
+    return queue.sync {
+      guard let db = db else { return 0 }
+      let sql = "DELETE FROM archived_points WHERE id IN " +
+        "(SELECT id FROM archived_points ORDER BY t ASC, id ASC LIMIT ?);"
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return 0
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_int(stmt, 1, Int32(over))
+      sqlite3_step(stmt)
+      return Int(sqlite3_changes(db))
+    }
+  }
+
+  func clearArchive() {
+    queue.sync {
+      guard let db = db else { return }
+      sqlite3_exec(db, "DELETE FROM archived_points;", nil, nil, nil)
+    }
+  }
+
+  func archiveCount() -> Int {
+    return queue.sync {
+      guard let db = db else { return 0 }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM archived_points;", -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return 0
+      }
+      defer { sqlite3_finalize(stmt) }
+      if sqlite3_step(stmt) == SQLITE_ROW {
+        return Int(sqlite3_column_int64(stmt, 0))
+      }
+      return 0
+    }
+  }
+
+  func archiveOldestT() -> Int64? {
+    return queue.sync {
+      guard let db = db else { return nil }
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, "SELECT MIN(t) FROM archived_points;", -1, &stmt, nil) == SQLITE_OK else {
+        sqlite3_finalize(stmt)
+        return nil
+      }
+      defer { sqlite3_finalize(stmt) }
+      guard sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+      return sqlite3_column_int64(stmt, 0)
+    }
+  }
+
+  /// Approximate on-disk size of the whole buffer DB (main file + WAL).
+  func dbFileSizeBytes() -> Int64 {
+    let fm = FileManager.default
+    let main = dbURL().path
+    var total: Int64 = 0
+    for path in [main, main + "-wal"] {
+      if let attrs = try? fm.attributesOfItem(atPath: path), let size = attrs[.size] as? NSNumber {
+        total += size.int64Value
+      }
+    }
+    return total
   }
 
   /// Sample of rows that have exhausted their attempts — for the eviction diagnostic.

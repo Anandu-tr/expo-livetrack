@@ -14,6 +14,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import expo.modules.livetrack.LiveTrackEventBus
 import expo.modules.livetrack.Prefs
+import expo.modules.livetrack.archive.ArchiveMaintenance
 import expo.modules.livetrack.diagnostics.DiagnosticsReporter
 import expo.modules.livetrack.diagnostics.DiagnosticsReporters
 import expo.modules.livetrack.buffer.BufferDb
@@ -21,9 +22,6 @@ import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.TimeUnit
 
@@ -60,8 +58,17 @@ class UploadWorker(
     val batchSize = prefs.getInt(Prefs.KEY_BATCH_SIZE, 50).coerceIn(1, SQL_VAR_CHUNK)
     val maxAttempts = prefs.getInt(Prefs.KEY_MAX_UPLOAD_ATTEMPTS, DEFAULT_MAX_UPLOAD_ATTEMPTS)
       .coerceAtLeast(1)
+    val archiveDays = prefs.getInt(Prefs.KEY_ARCHIVE_DAYS, 0)
     val reporter = DiagnosticsReporters.resolve(prefs)
-    val provider = loadProvider(prefs)
+    val provider = TokenProviders.load(prefs)
+    val db = BufferDb.getInstance(applicationContext)
+
+    // Retention runs here so the 15-min periodic pass keeps the archive bounded
+    // even on days with nothing to upload.
+    if (archiveDays > 0) {
+      runCatching { ArchiveMaintenance.run(db, archiveDays, System.currentTimeMillis()) }
+        .onFailure { reporter.recordFailure("db-write", it.message ?: "archive maintenance failed") }
+    }
 
     if (url.isNullOrBlank()) {
       // Not configured (yet) — nothing we can do; don't retry forever.
@@ -85,7 +92,7 @@ class UploadWorker(
       return@withContext Result.success()
     }
 
-    val dao: PointDao = BufferDb.getInstance(applicationContext).pointDao()
+    val dao: PointDao = db.pointDao()
 
     val rows = runCatching { dao.unsynced(batchSize) }.getOrElse {
       reporter.recordFailure(
@@ -97,10 +104,10 @@ class UploadWorker(
     }
     if (rows.isEmpty()) return@withContext Result.success()
 
-    val body = buildBody(rows)
+    val body = UploadClient.buildBody(rows)
 
     var outcome = try {
-      post(url, token, body)
+      UploadClient.post(url, token, body)
     } catch (e: Exception) {
       reporter.recordFailure(
         "upload-network", e.message ?: "network error",
@@ -118,7 +125,7 @@ class UploadWorker(
         token = fresh
         prefs.edit().putString(Prefs.KEY_TOKEN, fresh).apply()
         outcome = try {
-          post(url, token, body)
+          UploadClient.post(url, token, body)
         } catch (e: Exception) {
           reporter.recordFailure("upload-network", e.message ?: "network error after refresh")
           emitSyncError(e.message ?: "network error", null, dao)
@@ -131,7 +138,7 @@ class UploadWorker(
 
     when {
       outcome.code in 200..299 ->
-        handleAccepted(outcome, rows.map { it.id }, dao, reporter, url, maxAttempts)
+        handleAccepted(outcome, rows, db, reporter, url, maxAttempts, archiveDays)
       // 401/403 and other non-retryable client errors: stop retrying.
       outcome.code == 401 || outcome.code == 403 || outcome.code in 400..499 -> {
         reporter.recordFailure(
@@ -153,66 +160,7 @@ class UploadWorker(
     }
   }
 
-  // --- Token provider -----------------------------------------------------
-
-  /**
-   * Reflectively load the app-supplied [TokenProvider] named in config. Cached
-   * process-wide so we don't re-instantiate per run. Returns null if unconfigured
-   * or the class can't be loaded (then we fall back to the stored static token).
-   */
-  private fun loadProvider(prefs: android.content.SharedPreferences): TokenProvider? {
-    val className = prefs.getString(Prefs.KEY_TOKEN_PROVIDER_CLASS, null) ?: return null
-    cachedProvider?.let { if (it::class.java.name == className) return it }
-    return runCatching {
-      (Class.forName(className).getDeclaredConstructor().newInstance() as TokenProvider)
-    }.getOrNull()?.also { cachedProvider = it }
-  }
-
   private fun host(u: String): String = runCatching { URL(u).host }.getOrDefault("?")
-
-  // --- Body building ------------------------------------------------------
-
-  private fun buildBody(rows: List<PointEntity>): String {
-    val points = JSONArray()
-    val events = JSONArray()
-
-    for (r in rows) {
-      if (r.eventType == null) {
-        points.put(
-          JSONObject().apply {
-            put("id", r.id.toString())
-            put("u", r.userId)
-            put("l", r.lat ?: JSONObject.NULL)
-            put("g", r.lng ?: JSONObject.NULL)
-            put("t", r.t)
-            put("s", r.speed)
-            put("acc", r.acc)
-            put("b", r.batt)
-            put("c", r.charging)
-            put("act", r.act ?: "UNKNOWN")
-            put("mock", r.mock)
-          },
-        )
-      } else {
-        events.put(
-          JSONObject().apply {
-            put("id", r.id.toString())
-            put("u", r.userId)
-            put("e", r.eventType)
-            put("t", r.t)
-            r.lat?.let { put("l", it) }
-            r.lng?.let { put("g", it) }
-            if (r.batt >= 0) put("b", r.batt)
-          },
-        )
-      }
-    }
-
-    return JSONObject().apply {
-      put("points", points)
-      put("events", events)
-    }.toString()
-  }
 
   // --- ACK handling -------------------------------------------------------
 
@@ -229,12 +177,15 @@ class UploadWorker(
    */
   private fun handleAccepted(
     outcome: HttpOutcome,
-    sentIds: List<Long>,
-    dao: PointDao,
+    sent: List<PointEntity>,
+    db: BufferDb,
     reporter: DiagnosticsReporter,
     url: String,
     maxAttempts: Int,
+    archiveDays: Int,
   ): Result {
+    val dao = db.pointDao()
+    val sentIds = sent.map { it.id }
     val parsed = AckParser.parse(outcome.body)
     val sentSet = sentIds.toSet()
     // Only ever delete ids we actually sent. A server echoing its OWN primary keys
@@ -242,15 +193,22 @@ class UploadWorker(
     // by coincidence — that would be silent data loss.
     val accepted = parsed.filter { it in sentSet }
     val acceptedSet = accepted.toSet()
+    val acceptedRows = sent.filter { it.id in acceptedSet }
     val unacked = sentIds.filterNot { it in acceptedSet }
+    val now = System.currentTimeMillis()
 
-    accepted.chunked(SQL_VAR_CHUNK).forEach { chunk ->
-      runCatching { dao.deleteByIds(chunk) }.onFailure {
+    // Acked rows leave the buffer; with the archive on they are copied first, in
+    // the same transaction, so a crash in between can neither lose nor duplicate.
+    acceptedRows.chunked(SQL_VAR_CHUNK).forEach { chunk ->
+      runCatching { db.archiveAndDelete(chunk, now, archiveDays > 0) }.onFailure {
         reporter.recordFailure(
-          "db-write", it.message ?: "deleteByIds failed",
+          "db-write", it.message ?: "archiveAndDelete failed",
           mapOf("idsCount" to chunk.size.toString()),
         )
       }
+    }
+    if (acceptedRows.isNotEmpty() && archiveDays > 0) {
+      runCatching { ArchiveMaintenance.run(db, archiveDays, now) }
     }
 
     if (accepted.isEmpty()) {
@@ -329,30 +287,6 @@ class UploadWorker(
   private fun snippet(body: String?): String =
     (body ?: "").replace(WHITESPACE, " ").trim().take(BODY_SNIPPET_MAX)
 
-  // --- Networking ---------------------------------------------------------
-
-  private data class HttpOutcome(val code: Int, val body: String?)
-
-  private fun post(url: String, token: String, jsonBody: String): HttpOutcome {
-    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-      requestMethod = "POST"
-      connectTimeout = TIMEOUT_MS
-      readTimeout = TIMEOUT_MS
-      doOutput = true
-      setRequestProperty("Content-Type", "application/json")
-      setRequestProperty("Authorization", "Bearer $token")
-    }
-    try {
-      conn.outputStream.use { it.write(jsonBody.toByteArray(Charsets.UTF_8)) }
-      val code = conn.responseCode
-      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-      val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-      return HttpOutcome(code, text)
-    } finally {
-      conn.disconnect()
-    }
-  }
-
   // --- Error emission -----------------------------------------------------
 
   private fun emitSyncError(message: String, status: Int?, dao: PointDao, droppedCount: Int? = null) {
@@ -369,7 +303,6 @@ class UploadWorker(
 
   companion object {
     private const val PREFS = "livetrack_prefs"
-    private const val TIMEOUT_MS = 30_000
 
     /**
      * Attempts a row may sit unacknowledged under repeated 2xx responses before it
@@ -391,10 +324,6 @@ class UploadWorker(
     private const val BODY_SNIPPET_MAX = 300
 
     private val WHITESPACE = Regex("\\s+")
-
-    /** Reflectively-loaded token provider, cached process-wide. */
-    @Volatile
-    private var cachedProvider: TokenProvider? = null
 
     private const val UNIQUE_ONE_TIME = "livetrack_upload"
     private const val UNIQUE_PERIODIC = "livetrack_upload_periodic"

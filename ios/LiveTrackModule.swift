@@ -46,7 +46,9 @@ public class LiveTrackModule: Module {
     // typed `Record` struct / `Convertible` conformance instead, switch start's param
     // and the getState/requestPermissions return values to a Record. Also covers the
     // Int64 values in sendEvent payloads ("t") crossing the JS bridge.
-    Function("start") { (config: [String: Any]) in
+    // AsyncFunction (like Android): the TS surface declares `Promise<void>`, and a
+    // sync Function would surface native throws synchronously to `.catch` chains.
+    AsyncFunction("start") { (config: [String: Any], promise: Promise) in
       let url = config["url"] as? String ?? ""
       let token = config["token"] as? String ?? ""
       let userId = config["userId"] as? String ?? ""
@@ -66,6 +68,11 @@ public class LiveTrackModule: Module {
         1
       )
 
+      let diagnostics = config["diagnostics"] as? [String: Any] ?? [:]
+      let lifecycleEvents = diagnostics["lifecycleEvents"] as? Bool ?? false
+      // 0 = archive off; clamped natively to 0..365 (rolling window, not a data lake).
+      let archiveDays = min(max(Int(LiveTrackModule.num(config["archiveDays"], 0)), 0), 365)
+
       let cfg = TrackingConfig(
         url: url,
         token: token,
@@ -75,14 +82,119 @@ public class LiveTrackModule: Module {
         stillIntervalMs: stillIntervalMs,
         batchSize: batchSize,
         maxAccuracyM: maxAccuracyM,
-        maxUploadAttempts: maxUploadAttempts
+        maxUploadAttempts: maxUploadAttempts,
+        lifecycleEvents: lifecycleEvents,
+        archiveDays: archiveDays
       )
       TrackingManager.shared.start(config: cfg)
+      promise.resolve(nil)
     }
 
     // stop(): stop tracking + tear down timers.
-    Function("stop") {
+    AsyncFunction("stop") { (promise: Promise) in
       TrackingManager.shared.stop()
+      promise.resolve(nil)
+    }
+
+    // replay(fromMs, toMs): re-send archived rows with their ORIGINAL ids/times.
+    AsyncFunction("replay") { (fromMs: Double, toMs: Double, promise: Promise) in
+      guard let cfg = TrackingConfig.load(), !cfg.url.isEmpty, !cfg.token.isEmpty, !cfg.userId.isEmpty else {
+        promise.reject("ERR_REPLAY", "tracker not configured (call start first)")
+        return
+      }
+      DispatchQueue.global(qos: .utility).async {
+        let rows = Buffer.shared.archivedInRange(userId: cfg.userId, from: Int64(fromMs), to: Int64(toMs))
+        Uploader.shared.replay(url: cfg.url, token: cfg.token, rows: rows, batchSize: cfg.batchSize) { result in
+          switch result {
+          case .success(let r):
+            let out: [String: Any] = [
+              "sent": r.sent, "accepted": r.accepted, "batches": r.batches, "failedBatches": r.failedBatches,
+            ]
+            promise.resolve(out)
+          case .failure(let e):
+            if let re = e as? Uploader.ReplayError {
+              switch re {
+              case .auth: promise.reject("ERR_REPLAY_AUTH", "ingest returned 401")
+              case .busy: promise.reject("ERR_REPLAY_BUSY", "a replay is already in progress")
+              }
+            } else {
+              promise.reject("ERR_REPLAY", e.localizedDescription)
+            }
+          }
+        }
+      }
+    }
+
+    // getCoverage(fromMs, toMs, gapMs): archive UNION still-unsynced buffer rows.
+    AsyncFunction("getCoverage") { (fromMs: Double, toMs: Double, gapMs: Double, promise: Promise) in
+      let userId = TrackingConfig.load()?.userId ?? ""
+      DispatchQueue.global(qos: .userInitiated).async {
+        let from = Int64(fromMs)
+        let to = Int64(toMs)
+        var pts: [CoverageCalculator.Pt] = []
+        for r in Buffer.shared.archivedInRange(userId: userId, from: from, to: to) {
+          if let la = r.lat, let lo = r.lng { pts.append(CoverageCalculator.Pt(t: r.t, lat: la, lng: lo)) }
+        }
+        for r in Buffer.shared.locationsInRange(userId: userId, from: from, to: to) {
+          if let la = r.lat, let lo = r.lng { pts.append(CoverageCalculator.Pt(t: r.t, lat: la, lng: lo)) }
+        }
+        let gap = gapMs > 0 ? Int64(gapMs) : CoverageCalculator.defaultGapMs
+        let r = CoverageCalculator.compute(pts, gapMs: gap)
+        var out: [String: Any] = [
+          "count": r.count,
+          "gaps": r.gaps.map { g -> [String: Any] in
+            ["fromT": Double(g.fromT), "toT": Double(g.toT), "durationMs": Double(g.durationMs), "distanceM": g.distanceM]
+          },
+        ]
+        if let f = r.firstT { out["firstT"] = Double(f) } else { out["firstT"] = NSNull() }
+        if let l = r.lastT { out["lastT"] = Double(l) } else { out["lastT"] = NSNull() }
+        promise.resolve(out)
+      }
+    }
+
+    // clearArchive(): privacy hook — the host calls this on sign-out.
+    AsyncFunction("clearArchive") { (promise: Promise) in
+      DispatchQueue.global(qos: .utility).async {
+        Buffer.shared.clearArchive()
+        promise.resolve(nil)
+      }
+    }
+
+    // getArchiveStats(): row count, oldest timestamp, approximate on-disk size.
+    AsyncFunction("getArchiveStats") { (promise: Promise) in
+      DispatchQueue.global(qos: .utility).async {
+        var out: [String: Any] = [
+          "count": Buffer.shared.archiveCount(),
+          "sizeBytes": Double(Buffer.shared.dbFileSizeBytes()),
+        ]
+        if let oldest = Buffer.shared.archiveOldestT() {
+          out["oldestT"] = Double(oldest)
+        } else {
+          out["oldestT"] = NSNull()
+        }
+        promise.resolve(out)
+      }
+    }
+
+    // exportArchive(sinceId, limit): archived rows newer than sinceId, oldest first,
+    // for the TEMPORARY Supabase diagnostics upload (src/services/trackingLog.ts).
+    // Reads archived_points ONLY — stable/non-racy, unlike `points`, which the
+    // uploader deletes from the moment the backend ACKs a row.
+    AsyncFunction("exportArchive") { (sinceId: Double, limit: Double, promise: Promise) in
+      let userId = TrackingConfig.load()?.userId ?? ""
+      DispatchQueue.global(qos: .utility).async {
+        let rows = Buffer.shared.archivedAfterId(userId: userId, sinceId: Int64(sinceId), limit: Int(limit))
+        let out: [String: Any] = [
+          "rows": rows.map { r -> [String: Any] in
+            [
+              "l": r.lat ?? 0.0, "g": r.lng ?? 0.0, "t": Double(r.t), "s": r.speed, "acc": r.acc,
+              "b": r.batt, "c": r.charging, "act": r.act ?? "UNKNOWN", "mock": r.mock,
+            ]
+          },
+          "lastId": Double(rows.last?.id ?? Int64(sinceId)),
+        ]
+        promise.resolve(out)
+      }
     }
 
     // getState(): snapshot of tracking/permission/services/battery/buffer.

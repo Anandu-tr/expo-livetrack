@@ -9,6 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.location.Location
 import android.os.BatteryManager
 import android.os.Build
@@ -101,6 +105,59 @@ class TrackingService : Service() {
     }
   }
 
+  // Grace period before the cadence actually drops to stillIntervalMs (see
+  // onEnterStill). Runs on the same main-thread Handler as everything else
+  // here, so no synchronization is needed with isStill/onExitStill.
+  private val graceHandler = Handler(Looper.getMainLooper())
+  private val graceTick = Runnable {
+    if (isStill && isRunning) restartLocationUpdates()
+  }
+
+  // Significant-motion is a one-shot hardware trigger sensor (near-zero power,
+  // self-disarms after firing) that reports "device started moving" far faster
+  // than Activity Recognition's own sampling and independently of the location
+  // request's own interval. Armed only while still; a genuinely absent sensor
+  // (getDefaultSensor returns null on some devices) just means this signal
+  // never fires — AR sampling and GPS displacement remain the other two ways
+  // still mode ends.
+  private val sensorManager: SensorManager? by lazy {
+    getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+  }
+  private val significantMotionListener = object : TriggerEventListener() {
+    override fun onTrigger(event: TriggerEvent?) {
+      // Dispatch through the main-thread handler regardless of the actual
+      // delivery thread: requestTriggerSensor has no Handler-taking overload,
+      // so its callback thread is whatever Looper was active at registration
+      // time (the main thread here, since arming only ever happens from
+      // onEnterStill on the main thread) — but every other piece of mutable
+      // state in this class (isStill, currentActivity, lastLat/lastLng)
+      // assumes single-threaded main-looper access with no synchronization,
+      // so make that explicit rather than relying on an unenforced inference.
+      graceHandler.post {
+        // Self-disarmed by the OS already; the isStill check makes this a
+        // no-op if we left still mode through another path in the meantime.
+        if (isStill) {
+          // Matches every other exit-still trigger (AR transition/sample,
+          // GPS-displacement in noteAccepted()): clear the STILL label before
+          // exiting so the next captured fix isn't mislabeled "STILL" while
+          // actually moving again — speedActivity() takes over until AR corrects it.
+          currentActivity = "UNKNOWN"
+          onExitStill()
+        }
+      }
+    }
+  }
+
+  private fun armSignificantMotion() {
+    val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION) ?: return
+    runCatching { sensorManager?.requestTriggerSensor(significantMotionListener, sensor) }
+  }
+
+  private fun disarmSignificantMotion() {
+    val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION) ?: return
+    runCatching { sensorManager?.cancelTriggerSensor(significantMotionListener, sensor) }
+  }
+
   private var activityPendingIntent: PendingIntent? = null
   private var activitySamplePendingIntent: PendingIntent? = null
 
@@ -179,6 +236,8 @@ class TrackingService : Service() {
   override fun onDestroy() {
     isRunning = false
     heartbeatHandler.removeCallbacks(heartbeatTick)
+    graceHandler.removeCallbacks(graceTick)
+    disarmSignificantMotion()
     runCatching { fused.removeLocationUpdates(locationCallback) }
     removeActivityUpdates()
     unregisterProviderReceiver()
@@ -345,7 +404,7 @@ class TrackingService : Service() {
     // Monotonic age: a cached fix replayed after a restart looks current by
     // wall-clock but old by elapsedRealtime.
     val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000L
-    val fix = LocationGate.Fix(loc.latitude, loc.longitude, acc, loc.time)
+    val fix = LocationGate.Fix(loc.latitude, loc.longitude, acc, loc.time, loc.elapsedRealtimeNanos / 1_000_000L)
 
     val battery = readBattery()
     val mock = isMock(loc)
@@ -657,7 +716,14 @@ class TrackingService : Service() {
     // Write the fix the gate is holding first: it is the last real position
     // before the stationary period, and nothing else would release it in time.
     flushGate()
-    restartLocationUpdates() // switch to stillIntervalMs
+    // Grace period: keep the current (moving) cadence running for
+    // STILL_GRACE_MS instead of switching to stillIntervalMs immediately, so a
+    // stop-then-immediately-go-again is fully covered at full resolution and
+    // never loses a beat. Only if genuinely still-still after the grace
+    // window does graceTick actually throttle the cadence down.
+    graceHandler.removeCallbacks(graceTick)
+    graceHandler.postDelayed(graceTick, STILL_GRACE_MS)
+    armSignificantMotion() // near-instant, near-zero-power backup exit trigger
     emitHeartbeat() // immediate heartbeat on becoming still
     heartbeatHandler.removeCallbacks(heartbeatTick)
     heartbeatHandler.postDelayed(heartbeatTick, stillIntervalMs)
@@ -666,6 +732,8 @@ class TrackingService : Service() {
   private fun onExitStill() {
     if (!isStill) return
     isStill = false
+    graceHandler.removeCallbacks(graceTick)
+    disarmSignificantMotion()
     heartbeatHandler.removeCallbacks(heartbeatTick)
     restartLocationUpdates() // restore movingIntervalMs
   }
@@ -737,6 +805,13 @@ class TrackingService : Service() {
     private const val SAMPLE_INTERVAL_MS = 10_000L
     // Minimum confidence (0-100) before we trust a sampled activity.
     private const val MIN_CONFIDENCE = 50
+
+    // How long to keep the fast (moving) cadence running after entering STILL
+    // before actually throttling down to stillIntervalMs. Covers a stop that
+    // immediately starts moving again at full resolution, at the cost of
+    // spending the first bit of every stop — even a long one — at the
+    // higher-power cadence.
+    private const val STILL_GRACE_MS = 90_000L
 
     // A still-mode fix that moved this many `movingDistanceM`s from the anchor,
     // or that reports at least this speed, ends still mode without waiting for AR.

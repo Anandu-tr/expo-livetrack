@@ -24,8 +24,10 @@ be your actual app name; `[purpose]` should describe the legitimate business use
 > **Body:** [App name] collects your location data to record your field route
 > and distance travelled, **including in the background, even when the app is
 > closed or not in use**. Your location is sent securely to your organisation’s
-> backend and is used only for route and distance reporting for work. You can
-> stop tracking at any time from the app.
+> backend and is used only for route and distance reporting for work. A copy of
+> your route for the last [N] days is kept on this device so missing days can
+> be re-sent, and is deleted when you sign out. You can stop tracking at any
+> time from the app.
 >
 > **Buttons:** `No thanks` (decline) · `Allow & continue` (affirmative consent)
 
@@ -51,7 +53,10 @@ Data Safety section narrative.
 > Before any location permission is requested, the app shows an in-app prominent
 > disclosure (collection of location data, that it occurs in the background even
 > when the app is closed, and the purpose) and requires the user to affirmatively
-> consent. Users can stop tracking at any time from within the app.
+> consent. Users can stop tracking at any time from within the app. Location
+> records are held on the device only until they are uploaded, plus an optional
+> on-device copy for up to [N] days used solely to re-send missing data; it is
+> deleted on sign-out.
 
 ---
 

@@ -30,6 +30,9 @@ final class Uploader {
   // double-POST / double-delete the same rows. This guard keeps one sync in flight.
   private let lock = NSLock()
   private var inFlight = false
+  // A replay re-sends archived rows; it never touches `points`, so it cannot
+  // double-delete, but two streams to the server at once is what we avoid.
+  private var replayInFlight = false
 
   // Stands in for WorkManager's exponential backoff, which iOS has no equivalent of.
   // `sync()` is nudged on every fix (~12 s while moving), so without this a server
@@ -46,11 +49,14 @@ final class Uploader {
 
   /// Read up to `batchSize` rows, POST them, and on a 2xx delete the accepted ids.
   /// Network I/O is async via URLSession; the whole call returns immediately.
-  func sync(url: String, token: String, batchSize: Int, maxAttempts: Int = Uploader.defaultMaxUploadAttempts) {
+  func sync(
+    url: String, token: String, batchSize: Int,
+    maxAttempts: Int = Uploader.defaultMaxUploadAttempts, archiveDays: Int = 0
+  ) {
     guard !url.isEmpty, !token.isEmpty else { return }
 
     lock.lock()
-    if inFlight || Date().timeIntervalSince1970 < backoffUntil {
+    if inFlight || replayInFlight || Date().timeIntervalSince1970 < backoffUntil {
       lock.unlock()
       return
     }
@@ -119,8 +125,8 @@ final class Uploader {
 
       if (200...299).contains(status) {
         self.handleAccepted(
-          data: data, status: status, sentIds: rows.map { $0.id },
-          host: requestURL.host ?? "?", maxAttempts: maxAttempts
+          data: data, status: status, sentRows: rows,
+          host: requestURL.host ?? "?", maxAttempts: maxAttempts, archiveDays: archiveDays
         )
       } else {
         // Non-2xx: emit best-effort error, leave rows for retry. Never counts
@@ -140,8 +146,9 @@ final class Uploader {
   /// success — no delete, no counter, no signal — so devices re-POSTed the same
   /// batch indefinitely with zero observability.
   private func handleAccepted(
-    data: Data?, status: Int, sentIds: [Int64], host: String, maxAttempts: Int
+    data: Data?, status: Int, sentRows: [Buffer.Row], host: String, maxAttempts: Int, archiveDays: Int
   ) {
+    let sentIds = sentRows.map { $0.id }
     let parsed = AckParser.parse(data)
     let sentSet = Set(sentIds)
     // Only ever delete ids we actually sent. A server echoing its OWN primary keys
@@ -151,7 +158,16 @@ final class Uploader {
     let acceptedSet = Set(accepted)
     let unacked = sentIds.filter { !acceptedSet.contains($0) }
 
-    if !accepted.isEmpty { buffer.deleteByIds(accepted) }
+    // Acked rows leave the buffer; with the archive on they are copied first, in
+    // the same transaction. Chunked to keep every IN (...) under the variable limit.
+    let acceptedRows = sentRows.filter { acceptedSet.contains($0.id) }
+    if !acceptedRows.isEmpty {
+      for start in stride(from: 0, to: acceptedRows.count, by: 500) {
+        let chunk = Array(acceptedRows[start..<min(start + 500, acceptedRows.count)])
+        buffer.archiveAndDelete(rows: chunk, archive: archiveDays > 0)
+      }
+      if archiveDays > 0 { maintainArchive(days: archiveDays) }
+    }
 
     if accepted.isEmpty {
       // Fires on attempt #1, hours before any eviction.
@@ -231,9 +247,130 @@ final class Uploader {
     lock.unlock()
   }
 
+  // MARK: - Archive retention + replay
+
+  /// Rolling-window retention: prune by age, then by row cap. iOS has no periodic
+  /// worker, so this runs on start and after every acked upload.
+  func maintainArchive(days: Int) {
+    guard days > 0 else { return }
+    let cutoff = Int64(Date().timeIntervalSince1970 * 1000) - Int64(days) * 86_400_000
+    buffer.pruneArchive(before: cutoff)
+    buffer.trimArchive(cap: Buffer.archiveRowCap)
+  }
+
+  struct ReplayOutcome {
+    let sent: Int
+    let accepted: Int
+    let batches: Int
+    let failedBatches: Int
+  }
+
+  enum ReplayError: Error {
+    case busy
+    case auth
+  }
+
+  private static let replayPacingSeconds = 0.25
+  private static let replayMaxConsecutiveFailures = 3
+
+  /// Re-send archived rows with their ORIGINAL ids and times. Mirrors Android's
+  /// `ReplayRunner`: one replay at a time, paced, stops after 3 consecutive
+  /// failures, 401 → `.auth` (the JS side refreshes the token and retries).
+  func replay(
+    url: String, token: String, rows: [Buffer.Row], batchSize: Int,
+    completion: @escaping (Result<ReplayOutcome, Error>) -> Void
+  ) {
+    lock.lock()
+    if replayInFlight {
+      lock.unlock()
+      completion(.failure(ReplayError.busy))
+      return
+    }
+    replayInFlight = true
+    lock.unlock()
+
+    guard let requestURL = URL(string: url) else {
+      lock.lock(); replayInFlight = false; lock.unlock()
+      completion(.failure(NSError(domain: "livetrack", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad url"])))
+      return
+    }
+
+    DispatchQueue.global(qos: .utility).async { [self] in
+      var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+      bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "livetrack.replay") {
+        if bgTaskId != .invalid {
+          UIApplication.shared.endBackgroundTask(bgTaskId)
+          bgTaskId = .invalid
+        }
+      }
+      defer {
+        lock.lock(); replayInFlight = false; lock.unlock()
+        if bgTaskId != .invalid {
+          UIApplication.shared.endBackgroundTask(bgTaskId)
+          bgTaskId = .invalid
+        }
+      }
+
+      let size = min(max(batchSize, 1), 500)
+      var accepted = 0
+      var batches = 0
+      var failed = 0
+      var consecutive = 0
+
+      for start in stride(from: 0, to: rows.count, by: size) {
+        let chunk = Array(rows[start..<min(start + size, rows.count)])
+        batches += 1
+        guard let body = try? buildBody(rows: chunk) else {
+          failed += 1
+          consecutive += 1
+          if consecutive >= Uploader.replayMaxConsecutiveFailures { break }
+          continue
+        }
+        let (status, data) = postSync(url: requestURL, token: token, body: body)
+        if status == 401 {
+          completion(.failure(ReplayError.auth))
+          return
+        }
+        if (200...299).contains(status) {
+          let ids = Set(chunk.map { $0.id })
+          accepted += AckParser.parse(data).filter { ids.contains($0) }.count
+          consecutive = 0
+        } else {
+          failed += 1
+          consecutive += 1
+          if consecutive >= Uploader.replayMaxConsecutiveFailures { break }
+        }
+        Thread.sleep(forTimeInterval: Uploader.replayPacingSeconds)
+      }
+      completion(.success(ReplayOutcome(sent: rows.count, accepted: accepted, batches: batches, failedBatches: failed)))
+    }
+  }
+
+  /// Blocking POST used by the replay loop (runs on a utility queue, never main).
+  private func postSync(url: URL, token: String, body: Data) -> (Int, Data?) {
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 30
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    request.httpBody = body
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var status = -1
+    var payload: Data?
+    let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+      status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      payload = data
+      semaphore.signal()
+    }
+    task.resume()
+    _ = semaphore.wait(timeout: .now() + 45)
+    return (status, payload)
+  }
+
   // MARK: - Body building
 
-  private func buildBody(rows: [Buffer.Row]) throws -> Data {
+  func buildBody(rows: [Buffer.Row]) throws -> Data {
     var points: [[String: Any]] = []
     var events: [[String: Any]] = []
 
@@ -266,6 +403,8 @@ final class Uploader {
         if let lat = r.lat { e["l"] = lat }
         if let lng = r.lng { e["g"] = lng }
         if r.batt >= 0 { e["b"] = r.batt }
+        // Lifecycle events carry their reason (relaunch/stop/...) in `act`.
+        if let reason = r.act { e["r"] = reason }
         events.append(e)
       }
     }

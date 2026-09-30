@@ -21,10 +21,15 @@ import expo.modules.kotlin.Promise
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import expo.modules.livetrack.archive.CoverageCalculator
+import expo.modules.livetrack.archive.ReplayRunner
+import expo.modules.livetrack.buffer.ArchivedPointEntity
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointEntity
 import expo.modules.livetrack.keepalive.Watchdog
+import expo.modules.livetrack.sync.TokenProviders
 import expo.modules.livetrack.sync.UploadWorker
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -86,10 +91,14 @@ class LiveTrackModule : Module() {
         cadence["maxUploadAttempts"], UploadWorker.DEFAULT_MAX_UPLOAD_ATTEMPTS.toLong(),
       ).toInt().coerceAtLeast(1)
 
+      // 0 = archive off. Clamped: the archive is a rolling window, not a data lake.
+      val archiveDays = numLong(config["archiveDays"], 0L).toInt().coerceIn(0, 365)
+
       val tokenProviderClass = config["tokenProviderClass"] as? String
       @Suppress("UNCHECKED_CAST")
       val diagnostics = config["diagnostics"] as? Map<String, Any?> ?: emptyMap()
       val crashlyticsOn = diagnostics["crashlytics"] as? Boolean ?: false
+      val lifecycleOn = diagnostics["lifecycleEvents"] as? Boolean ?: false
 
       // Persist for the uploader + reboot re-arm. wasTracking lets BootReceiver
       // / Watchdog know whether to resume after a reboot or process death.
@@ -103,13 +112,16 @@ class LiveTrackModule : Module() {
         putFloat(Prefs.KEY_MAX_ACCURACY_M, maxAccuracyM.toFloat())
         putInt(Prefs.KEY_BATCH_SIZE, batchSize)
         putInt(Prefs.KEY_MAX_UPLOAD_ATTEMPTS, maxUploadAttempts)
+        putInt(Prefs.KEY_ARCHIVE_DAYS, archiveDays)
         putBoolean(Prefs.KEY_DIAGNOSTICS_CRASHLYTICS, crashlyticsOn)
+        putBoolean(Prefs.KEY_DIAGNOSTICS_LIFECYCLE, lifecycleOn)
         putString(Prefs.KEY_TOKEN_PROVIDER_CLASS, tokenProviderClass)
         putBoolean(Prefs.KEY_WAS_TRACKING, true)
         apply()
       }
 
       val intent = Intent(context, TrackingService::class.java).apply {
+        putExtra(TrackingService.EXTRA_START_REASON, "manual")
         putExtra(TrackingService.EXTRA_URL, url)
         putExtra(TrackingService.EXTRA_TOKEN, token)
         putExtra(TrackingService.EXTRA_USER_ID, userId)
@@ -223,6 +235,139 @@ class LiveTrackModule : Module() {
         },
         *foreground,
       )
+    }
+
+    // replay(fromMs, toMs): re-send archived rows for a window with their ORIGINAL
+    // ids and times (idempotent on a server that keys by them). Never touches the
+    // live buffer; still-unsynced rows in the window go the normal way (nudged).
+    AsyncFunction("replay") { fromMs: Double, toMs: Double, promise: Promise ->
+      scope.launch {
+        runCatching {
+          val ctx = context
+          val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+          val url = prefs.getString(Prefs.KEY_URL, null)
+          val token = prefs.getString(Prefs.KEY_TOKEN, null)
+          val userId = prefs.getString(Prefs.KEY_USER_ID, "") ?: ""
+          if (url.isNullOrBlank() || token.isNullOrBlank() || userId.isBlank()) {
+            throw IllegalStateException("tracker not configured (call start first)")
+          }
+          val batchSize = prefs.getInt(Prefs.KEY_BATCH_SIZE, 50).coerceIn(1, 500)
+          val rows = BufferDb.getInstance(ctx).archiveDao()
+            .inRange(userId, fromMs.toLong(), toMs.toLong())
+          val r = ReplayRunner.run(
+            rows = rows,
+            url = url,
+            initialToken = token,
+            batchSize = batchSize,
+            provider = TokenProviders.load(prefs),
+            onTokenRefreshed = { prefs.edit().putString(Prefs.KEY_TOKEN, it).apply() },
+          )
+          runCatching { UploadWorker.enqueue(ctx) }
+          Bundle().apply {
+            putInt("sent", r.sent)
+            putInt("accepted", r.accepted)
+            putInt("batches", r.batches)
+            putInt("failedBatches", r.failedBatches)
+          }
+        }.onSuccess { promise.resolve(it) }.onFailure {
+          when (it) {
+            is ReplayRunner.AuthException -> promise.reject("ERR_REPLAY_AUTH", it.message, it)
+            is ReplayRunner.BusyException -> promise.reject("ERR_REPLAY_BUSY", it.message, it)
+            else -> promise.reject("ERR_REPLAY", it.message, it)
+          }
+        }
+      }
+    }
+
+    // getCoverage(fromMs, toMs, gapMs): count/first/last/gaps over the archive UNION
+    // the still-unsynced buffer, so a day with pending uploads is not a false gap.
+    AsyncFunction("getCoverage") { fromMs: Double, toMs: Double, gapMs: Double, promise: Promise ->
+      scope.launch {
+        runCatching {
+          val ctx = context
+          val db = BufferDb.getInstance(ctx)
+          val userId = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(Prefs.KEY_USER_ID, "") ?: ""
+          val from = fromMs.toLong()
+          val to = toMs.toLong()
+          val pts = ArrayList<CoverageCalculator.Pt>()
+          for (p in db.archiveDao().inRange(userId, from, to)) {
+            val la = p.lat ?: continue
+            val lo = p.lng ?: continue
+            pts += CoverageCalculator.Pt(p.t, la, lo)
+          }
+          for (p in db.pointDao().locationsInRange(userId, from, to)) {
+            val la = p.lat ?: continue
+            val lo = p.lng ?: continue
+            pts += CoverageCalculator.Pt(p.t, la, lo)
+          }
+          val gap = if (gapMs > 0) gapMs.toLong() else CoverageCalculator.DEFAULT_GAP_MS
+          val r = CoverageCalculator.compute(pts, gap)
+          mapOf(
+            "count" to r.count,
+            "firstT" to r.firstT?.toDouble(),
+            "lastT" to r.lastT?.toDouble(),
+            "gaps" to r.gaps.map {
+              mapOf(
+                "fromT" to it.fromT.toDouble(),
+                "toT" to it.toT.toDouble(),
+                "durationMs" to it.durationMs.toDouble(),
+                "distanceM" to it.distanceM,
+              )
+            },
+          )
+        }.onSuccess { promise.resolve(it) }
+          .onFailure { promise.reject("ERR_GET_COVERAGE", it.message, it) }
+      }
+    }
+
+    // clearArchive(): privacy hook — the host calls this on sign-out.
+    AsyncFunction("clearArchive") { promise: Promise ->
+      scope.launch {
+        runCatching { BufferDb.getInstance(context).archiveDao().clear() }
+          .onSuccess { promise.resolve(null) }
+          .onFailure { promise.reject("ERR_CLEAR_ARCHIVE", it.message, it) }
+      }
+    }
+
+    // getArchiveStats(): row count, oldest timestamp, approximate on-disk size
+    // (whole buffer DB including WAL — an upper bound, cheap to read).
+    AsyncFunction("getArchiveStats") { promise: Promise ->
+      scope.launch {
+        runCatching {
+          val ctx = context
+          val dao = BufferDb.getInstance(ctx).archiveDao()
+          val dbFile = ctx.getDatabasePath("livetrack_buffer.db")
+          val size = dbFile.length() + File(dbFile.path + "-wal").length()
+          Bundle().apply {
+            putInt("count", dao.countAll())
+            dao.oldestT()?.let { putDouble("oldestT", it.toDouble()) }
+            putDouble("sizeBytes", size.toDouble())
+          }
+        }.onSuccess { promise.resolve(it) }
+          .onFailure { promise.reject("ERR_ARCHIVE_STATS", it.message, it) }
+      }
+    }
+
+    // exportArchive(sinceId, limit): archived rows newer than sinceId, oldest first,
+    // for the TEMPORARY Supabase diagnostics upload (src/services/trackingLog.ts).
+    // Reads archived_points ONLY — stable/non-racy, unlike `points`, which the
+    // uploader deletes from the moment the backend ACKs a row.
+    AsyncFunction("exportArchive") { sinceId: Double, limit: Double, promise: Promise ->
+      scope.launch {
+        runCatching {
+          val ctx = context
+          val userId = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(Prefs.KEY_USER_ID, "") ?: ""
+          val rows = BufferDb.getInstance(ctx).archiveDao()
+            .rowsAfterId(userId, sinceId.toLong(), limit.toInt())
+          mapOf(
+            "rows" to rows.map { archivedPointRecord(it) },
+            "lastId" to (rows.lastOrNull()?.id ?: sinceId.toLong()).toDouble(),
+          )
+        }.onSuccess { promise.resolve(it) }
+          .onFailure { promise.reject("ERR_EXPORT_ARCHIVE", it.message, it) }
+      }
     }
 
     // ensureNotKilled(): ask the OS to exempt us from battery optimization so the
@@ -350,6 +495,56 @@ class LiveTrackModule : Module() {
           }
       }.onFailure { promise.reject("ERR_REQUEST_ENABLE_LOCATION", it.message, it) }
     }
+
+    // getOemAutostartInfo(): cheap, side-effect-free check for whether this
+    // device's manufacturer is a known aggressive background-killer with its
+    // own separate "autostart"/"protected apps" allowlist outside Android's
+    // standard battery-optimization exemption. The host app uses this to
+    // decide whether to show the one-time onboarding prompt at all.
+    AsyncFunction("getOemAutostartInfo") { promise: Promise ->
+      runCatching {
+        val manufacturer = Build.MANUFACTURER ?: ""
+        mapOf(
+          "manufacturer" to manufacturer,
+          "hasKnownSettings" to expo.modules.livetrack.oem.OemAutostart.isKnownAggressiveOem(manufacturer),
+        )
+      }.onSuccess { promise.resolve(it) }
+        .onFailure { promise.reject("ERR_OEM_AUTOSTART_INFO", it.message, it) }
+    }
+
+    // openAutostartSettings(): best-effort launch of this OEM's autostart
+    // settings screen. Tries each known candidate ComponentName in order
+    // (they drift across ROM versions) and falls back to the generic
+    // app-info screen so the user always lands somewhere actionable rather
+    // than seeing nothing happen.
+    AsyncFunction("openAutostartSettings") { promise: Promise ->
+      runCatching {
+        val ctx = context
+        val manufacturer = Build.MANUFACTURER ?: ""
+        val candidates = expo.modules.livetrack.oem.OemAutostart.candidatesFor(manufacturer)
+        var attempted = false
+        for (component in candidates) {
+          val intent = Intent().apply {
+            this.component = component
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+          if (runCatching { ctx.startActivity(intent) }.isSuccess) {
+            attempted = true
+            break
+          }
+        }
+        if (!attempted) {
+          // Fallback: generic app-info screen, always resolvable.
+          val fallback = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:${ctx.packageName}"),
+          ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+          runCatching { ctx.startActivity(fallback) }
+        }
+        mapOf("attempted" to attempted, "manufacturer" to manufacturer)
+      }.onSuccess { promise.resolve(it) }
+        .onFailure { promise.reject("ERR_OEM_AUTOSTART_OPEN", it.message, it) }
+    }
   }
 
   // --- Helpers ------------------------------------------------------------
@@ -456,6 +651,19 @@ class LiveTrackModule : Module() {
     }
     runCatching { LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_EVENT, payload) }
   }
+
+  /** Wire shape matching `LocationRecord` in LiveTrack.types.ts (l/g/t/s/acc/b/c/act/mock). */
+  private fun archivedPointRecord(p: ArchivedPointEntity): Map<String, Any?> = mapOf(
+    "l" to (p.lat ?: 0.0),
+    "g" to (p.lng ?: 0.0),
+    "t" to p.t.toDouble(),
+    "s" to p.speed,
+    "acc" to p.acc,
+    "b" to p.batt,
+    "c" to p.charging,
+    "act" to (p.act ?: "UNKNOWN"),
+    "mock" to p.mock,
+  )
 
   private fun numLong(v: Any?, default: Long): Long = when (v) {
     is Number -> v.toLong()

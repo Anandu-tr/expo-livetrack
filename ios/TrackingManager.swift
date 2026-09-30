@@ -21,9 +21,23 @@ struct TrackingConfig: Codable {
   /// `resumeIfNeeded()`. Read it through `effectiveMaxUploadAttempts`.
   let maxUploadAttempts: Int?
 
+  /// Opt-in SERVICE_STARTED / SERVICE_STOPPED rows. Optional for the same
+  /// persisted-blob reason as `maxUploadAttempts`. Off until the ingest backend
+  /// accepts the new event types.
+  let lifecycleEvents: Bool?
+
+  /// Days of acknowledged location rows kept on-device for replay. Optional for
+  /// the same persisted-blob reason. nil/0 = archive off.
+  let archiveDays: Int?
+
   /// Attempt budget with the back-compat fallback applied.
   var effectiveMaxUploadAttempts: Int {
     max(maxUploadAttempts ?? Uploader.defaultMaxUploadAttempts, 1)
+  }
+
+  /// Retention window clamped like Android (0..365).
+  var effectiveArchiveDays: Int {
+    min(max(archiveDays ?? 0, 0), 365)
   }
 
   private static let key = "expo.modules.livetrack.config"
@@ -67,11 +81,23 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
   private var config: TrackingConfig?
   private(set) var isTracking = false
 
-  // Last known position, used to give HEARTBEAT rows context.
+  // Last ACCEPTED position, used to give HEARTBEAT / lifecycle rows context.
   private var lastLat: Double?
   private var lastLng: Double?
   private var lastMovedAt: TimeInterval = Date().timeIntervalSince1970
   private var heartbeatTimer: Timer?
+
+  /// Metadata captured at arrival that travels with a fix through the gate's hold.
+  private struct PendingPoint {
+    let speed: Double
+    let batt: Int
+    let charging: Bool
+    let mock: Bool
+  }
+
+  // Noise gate; rebuilt on every (re)start so a fresh start() resets the anchor.
+  private var gate: LocationGate<PendingPoint>?
+  private var startReason = "manual"
 
   // Permission delta tracking (PERMISSION_GRANTED / PERMISSION_REVOKED) mirrors Android.
   private var lastAuthGranted: Bool?
@@ -88,14 +114,18 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
     self.config = config
     config.save()
     TrackingConfig.wasTracking = true
+    startReason = "manual"
     ensureManager()
     configureAndStart()
+    // No periodic worker on iOS: retention runs on start and after every ack.
+    Uploader.shared.maintainArchive(days: config.effectiveArchiveDays)
   }
 
   /// Re-arm after a cold relaunch (called by the host AppDelegate on location wake).
   func resumeIfNeeded() {
     guard TrackingConfig.wasTracking, let cfg = TrackingConfig.load() else { return }
     self.config = cfg
+    startReason = "relaunch"
     ensureManager()
     configureAndStart()
   }
@@ -118,6 +148,9 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
     heartbeatTimer = nil
     manager?.stopUpdatingLocation()
     manager?.stopMonitoringSignificantLocationChanges()
+    // The gate may still hold the last real fix; write it before going quiet.
+    flushGate()
+    bufferLifecycleEvent("SERVICE_STOPPED", reason: "stop")
   }
 
   // MARK: - Manager configuration
@@ -159,8 +192,16 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
       if CLLocationManager.significantLocationChangeMonitoringAvailable() {
         m.startMonitoringSignificantLocationChanges()
       }
+      // A (re)start means a fresh anchor; release anything the old gate still held.
+      self.flushGate()
+      self.gate = LocationGate<PendingPoint>(
+        movingDistanceM: cfg.movingDistanceM,
+        maxAccuracyM: cfg.maxAccuracyM,
+        keepaliveMs: cfg.stillIntervalMs
+      )
       self.isTracking = true
       self.scheduleHeartbeatTimer()
+      self.bufferLifecycleEvent("SERVICE_STARTED", reason: self.startReason)
     }
     if Thread.isMainThread { work() } else { DispatchQueue.main.async { work() } }
   }
@@ -224,61 +265,104 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
 
   private func handleLocation(_ location: CLLocation) {
     guard let cfg = config else { return }
-
-    // On-device accuracy filter — prevents unbounded buffer growth from points the
-    // server would reject (drop acc < 0 [invalid] or acc > maxAccuracyM).
-    let acc = location.horizontalAccuracy
-    if acc < 0 || acc > cfg.maxAccuracyM {
-      return // SKIP — do not buffer
+    let g: LocationGate<PendingPoint>
+    if let existing = gate {
+      g = existing
+    } else {
+      g = LocationGate<PendingPoint>(
+        movingDistanceM: cfg.movingDistanceM,
+        maxAccuracyM: cfg.maxAccuracyM,
+        keepaliveMs: cfg.stillIntervalMs
+      )
+      gate = g
     }
 
-    let lat = location.coordinate.latitude
-    let lng = location.coordinate.longitude
-
-    // Movement bookkeeping for the heartbeat (distanceFilter already gates updates,
-    // but track timing so a stationary device still triggers heartbeats).
-    lastLat = lat
-    lastLng = lng
-    lastMovedAt = Date().timeIntervalSince1970
-
-    let battery = TrackingManager.readBattery()
-    let mock = TrackingManager.isMock(location)
+    // The gate enforces acc >= 0 and acc <= maxAccuracyM (the server enforces the
+    // latter too — a buffered row it refuses is never ACKed and re-sent forever),
+    // plus staleness, ordering, implied speed, jitter and zig-zag.
+    let acc = location.horizontalAccuracy
     // Match Android: epoch milliseconds from the fix timestamp.
     let t = Int64(location.timestamp.timeIntervalSince1970 * 1000)
-    let speed = max(0, location.speed) // CLLocation.speed is -1 when invalid
+    let ageMs = -location.timestamp.timeIntervalSinceNow * 1000
+    let fix = LocationGate<PendingPoint>.Fix(
+      lat: location.coordinate.latitude, lng: location.coordinate.longitude, acc: acc, t: t
+    )
 
-    Buffer.shared.insertLocation(
-      userId: cfg.userId,
-      t: t,
-      lat: lat,
-      lng: lng,
-      speed: speed,
-      acc: acc,
+    let battery = TrackingManager.readBattery()
+    let pending = PendingPoint(
+      speed: max(0, location.speed), // CLLocation.speed is -1 when invalid
       batt: battery.level,
       charging: battery.charging,
-      act: "UNKNOWN", // iOS has no cheap activity-type here (CMMotionActivity is separate)
-      mock: mock
+      mock: TrackingManager.isMock(location)
+    )
+
+    switch g.evaluate(fix: fix, ageMs: ageMs, payload: pending) {
+    case .reject:
+      return
+    case .hold:
+      noteAccepted(fix)
+    case .release(let released, let payload, _):
+      noteAccepted(fix)
+      writePoint(fix: released, meta: payload, act: "UNKNOWN", userId: cfg.userId)
+    case .snap(let lat, let lng, let snapT):
+      // Stationary keepalive at the anchor: proves liveness without painting
+      // the jitter blob a parked device otherwise produces.
+      let snapFix = LocationGate<PendingPoint>.Fix(lat: lat, lng: lng, acc: acc, t: snapT)
+      let meta = PendingPoint(speed: 0, batt: battery.level, charging: battery.charging, mock: pending.mock)
+      writePoint(fix: snapFix, meta: meta, act: "STILL", userId: cfg.userId)
+    }
+  }
+
+  /// Bookkeeping for every fix the gate accepted (held or released). Only accepted
+  /// fixes count as movement, so stationary jitter no longer silences the heartbeat.
+  private func noteAccepted(_ fix: LocationGate<PendingPoint>.Fix) {
+    lastLat = fix.lat
+    lastLng = fix.lng
+    lastMovedAt = Date().timeIntervalSince1970
+  }
+
+  private func writePoint(
+    fix: LocationGate<PendingPoint>.Fix, meta: PendingPoint, act: String, userId: String
+  ) {
+    Buffer.shared.insertLocation(
+      userId: userId,
+      t: fix.t,
+      lat: fix.lat,
+      lng: fix.lng,
+      speed: meta.speed,
+      acc: fix.acc,
+      batt: meta.batt,
+      charging: meta.charging,
+      act: act, // iOS has no cheap activity-type here (CMMotionActivity is separate)
+      mock: meta.mock
     )
 
     triggerSync()
 
     let payload: [String: Any] = [
-      "l": lat,
-      "g": lng,
-      "t": t,
-      "s": speed,
-      "acc": acc,
-      "b": battery.level,
-      "c": battery.charging,
-      "act": "UNKNOWN",
-      "mock": mock,
+      "l": fix.lat,
+      "g": fix.lng,
+      "t": fix.t,
+      "s": meta.speed,
+      "acc": fix.acc,
+      "b": meta.batt,
+      "c": meta.charging,
+      "act": act,
+      "mock": meta.mock,
     ]
     emitToJS("onLocation", payload)
 
-    if mock {
-      let ev: [String: Any] = ["e": "MOCK_DETECTED", "t": t, "l": lat, "g": lng, "b": battery.level]
+    if meta.mock {
+      let ev: [String: Any] = ["e": "MOCK_DETECTED", "t": fix.t, "l": fix.lat, "g": fix.lng, "b": meta.batt]
       emitToJS("onEvent", ev)
     }
+  }
+
+  /// Release the fix the gate is holding for its lookahead (stop / restart).
+  private func flushGate() {
+    guard let cfg = config, let flushed = gate?.flush() else { return }
+    let (fix, meta) = flushed
+    writePoint(fix: fix, meta: meta, act: "UNKNOWN", userId: cfg.userId)
   }
 
   private static func isMock(_ location: CLLocation) -> Bool {
@@ -297,7 +381,7 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
     guard let cfg = config else { return }
     Uploader.shared.sync(
       url: cfg.url, token: cfg.token, batchSize: cfg.batchSize,
-      maxAttempts: cfg.effectiveMaxUploadAttempts
+      maxAttempts: cfg.effectiveMaxUploadAttempts, archiveDays: cfg.effectiveArchiveDays
     )
   }
 
@@ -312,15 +396,21 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
   }
 
   /// Buffer a lifecycle event row + emit onEvent (best-effort).
-  private func bufferLifecycleEvent(_ type: String) {
+  ///
+  /// `reason` is only used by SERVICE_STARTED / SERVICE_STOPPED, which are opt-in
+  /// via `diagnostics.lifecycleEvents` (the ingest backend must accept the new
+  /// event types first). It rides in the `act` column and is serialised as `r`.
+  private func bufferLifecycleEvent(_ type: String, reason: String? = nil) {
+    if reason != nil, !(config?.lifecycleEvents ?? false) { return }
     let batt = TrackingManager.readBattery().level
-    Buffer.shared.insertEvent(type: type, lastLat: lastLat, lastLng: lastLng, batt: batt)
+    Buffer.shared.insertEvent(type: type, lastLat: lastLat, lastLng: lastLng, batt: batt, reason: reason)
     triggerSync()
-    let payload: [String: Any] = [
+    var payload: [String: Any] = [
       "e": type,
       "t": Int64(Date().timeIntervalSince1970 * 1000),
       "b": batt,
     ]
+    if let reason = reason { payload["r"] = reason }
     emitToJS("onEvent", payload)
   }
 

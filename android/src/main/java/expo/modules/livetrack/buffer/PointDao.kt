@@ -59,4 +59,14 @@ interface PointDao {
   /** Total buffered rows (used by getState.bufferedCount). */
   @Query("SELECT COUNT(*) FROM points")
   fun count(): Int
+
+  /**
+   * Still-unsynced location rows for one user in `[from, to)`. Unioned with the
+   * archive by `getCoverage` so a day with pending uploads is not reported as a gap.
+   */
+  @Query(
+    "SELECT * FROM points WHERE userId = :userId AND eventType IS NULL AND lat IS NOT NULL " +
+      "AND t >= :from AND t < :to ORDER BY t ASC, id ASC",
+  )
+  fun locationsInRange(userId: String, from: Long, to: Long): List<PointEntity>
 }

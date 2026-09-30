@@ -26,12 +26,22 @@ object Prefs {
    */
   const val KEY_MAX_UPLOAD_ATTEMPTS = "maxUploadAttempts"
 
+  /** Days of acknowledged location rows kept on-device for replay. 0 = archive off. */
+  const val KEY_ARCHIVE_DAYS = "archiveDays"
+
   // Token provider: fully-qualified class name of a native TokenProvider impl the
   // uploader loads (reflection) to mint fresh tokens without the app's JS running.
   const val KEY_TOKEN_PROVIDER_CLASS = "tokenProviderClass"
 
   // Diagnostics config.
   const val KEY_DIAGNOSTICS_CRASHLYTICS = "diagnosticsCrashlytics"
+
+  /**
+   * Opt-in SERVICE_STARTED / SERVICE_STOPPED event rows. Off by default because
+   * the ingest backend must accept the new event types first — an unknown type
+   * that makes the server reject a batch would stall every point behind it.
+   */
+  const val KEY_DIAGNOSTICS_LIFECYCLE = "diagnosticsLifecycle"
 
   /** Set true by start(), false by stop(); read by BootReceiver/Watchdog. */
   const val KEY_WAS_TRACKING = "wasTracking"

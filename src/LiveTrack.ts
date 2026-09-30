@@ -2,13 +2,22 @@ import type { EventSubscription } from 'expo-modules-core';
 
 import LiveTrackModule from './LiveTrackModule';
 import type {
+  ArchiveStats,
   Cadence,
+  DayCoverage,
+  ExportResult,
   LocationRecord,
+  OemAutostartInfo,
+  OemAutostartResult,
+  ReplayResult,
   StartConfig,
   SyncError,
   TrackerEvent,
   TrackerState,
 } from './LiveTrack.types';
+
+/** Silence longer than this counts as a coverage gap (10 minutes). */
+const DEFAULT_GAP_MS = 600_000;
 
 /**
  * Default capture cadence. Callers override individual fields via
@@ -61,6 +70,24 @@ export const LiveTracker = {
   },
 
   /**
+   * Whether this device's manufacturer is a known aggressive background
+   * killer (MIUI/ColorOS/FuntouchOS/realme UI) with its own separate
+   * autostart allowlist outside the standard battery-optimization exemption.
+   * Side-effect-free — use to decide whether to show an autostart prompt.
+   */
+  getOemAutostartInfo(): Promise<OemAutostartInfo> {
+    return LiveTrackModule.getOemAutostartInfo();
+  },
+
+  /**
+   * Best-effort launch of this OEM's autostart settings screen. Falls back
+   * to the generic app-info screen if no known screen could be opened.
+   */
+  openAutostartSettings(): Promise<OemAutostartResult> {
+    return LiveTrackModule.openAutostartSettings();
+  },
+
+  /**
    * Ask the OS to enable location services. Thin pass-through to native.
    *
    * NOTE: This package never shows a popup on its own. The host app decides
@@ -69,6 +96,44 @@ export const LiveTracker = {
    */
   requestEnableLocation(): Promise<boolean> {
     return LiveTrackModule.requestEnableLocation();
+  },
+
+  /**
+   * Re-send archived location rows captured in `[fromMs, toMs)` to the ingest
+   * URL with their ORIGINAL ids and times. Requires `archiveDays > 0` at start.
+   * Rejects with code `ERR_REPLAY_AUTH` (refresh the token via `start()` and
+   * retry) or `ERR_REPLAY_BUSY` (a replay is already running).
+   */
+  replay(fromMs: number, toMs: number): Promise<ReplayResult> {
+    return LiveTrackModule.replay(fromMs, toMs);
+  },
+
+  /**
+   * Summary of what this device captured in `[fromMs, toMs)`: archive plus
+   * still-unsynced rows. `gapMs` always reaches native (no optional-arg
+   * bridging differences between platforms).
+   */
+  getCoverage(fromMs: number, toMs: number, gapMs: number = DEFAULT_GAP_MS): Promise<DayCoverage> {
+    return LiveTrackModule.getCoverage(fromMs, toMs, gapMs);
+  },
+
+  /** Delete the on-device archive. Call on sign-out. */
+  clearArchive(): Promise<void> {
+    return LiveTrackModule.clearArchive();
+  },
+
+  getArchiveStats(): Promise<ArchiveStats> {
+    return LiveTrackModule.getArchiveStats();
+  },
+
+  /**
+   * Archived rows for the current user with id > sinceId (oldest first, capped
+   * at `limit`). Reads the stable on-device archive, not the live upload buffer —
+   * unaffected by the native uploader's own upload-then-delete cycle. Requires
+   * `archiveDays > 0` at `start()`.
+   */
+  exportArchive(sinceId: number, limit: number): Promise<ExportResult> {
+    return LiveTrackModule.exportArchive(sinceId, limit);
   },
 
   /**

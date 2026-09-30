@@ -5,7 +5,11 @@ export type EventType =
   | 'PERMISSION_GRANTED'
   | 'MOCK_DETECTED'
   | 'BATTERY_OPT_ON'
-  | 'HEARTBEAT';
+  | 'HEARTBEAT'
+  /** Opt-in via `Diagnostics.lifecycleEvents`; `r` carries the start reason. */
+  | 'SERVICE_STARTED'
+  /** Opt-in via `Diagnostics.lifecycleEvents`; `r` carries the stop reason. */
+  | 'SERVICE_STOPPED';
 
 export interface Cadence {
   movingIntervalMs?: number; // default 12000
@@ -28,6 +32,14 @@ export interface Cadence {
 /** Opt-in operational diagnostics. `crashlytics` routes native upload/SQL failures to Crashlytics. */
 export interface Diagnostics {
   crashlytics?: boolean;
+  /**
+   * Buffer SERVICE_STARTED / SERVICE_STOPPED event rows (with a reason such as
+   * `boot`, `watchdog`, `sticky_restart`, `task_removed`) so kills and restarts
+   * of the background service become visible server-side. Default false: the
+   * ingest backend must accept these event types first — a batch it rejects
+   * would stall every point behind it.
+   */
+  lifecycleEvents?: boolean;
 }
 
 export interface StartConfig {
@@ -45,6 +57,45 @@ export interface StartConfig {
    */
   tokenProviderClass?: string;
   diagnostics?: Diagnostics;
+  /**
+   * Days of server-acknowledged location rows kept on the device (separate
+   * `archived_points` table) so a day can be audited with `getCoverage()` or
+   * re-sent with `replay()` if the server lost it. 0 or omitted = off. Clamped
+   * natively to 0..365 and to 400 000 rows in total. Cleared by `clearArchive()`
+   * — call it on sign-out; the archive is location history.
+   */
+  archiveDays?: number;
+}
+
+/** Result of `replay()`: rows re-sent from the archive and how many the server acknowledged. */
+export interface ReplayResult {
+  sent: number;
+  accepted: number;
+  batches: number;
+  failedBatches: number;
+}
+
+/** A silence longer than the gap threshold, with the straight-line distance covered meanwhile. */
+export interface CoverageGap {
+  fromT: number;
+  toT: number;
+  durationMs: number;
+  distanceM: number;
+}
+
+/** Result of `getCoverage()`: archive ∪ still-unsynced buffer for the window. */
+export interface DayCoverage {
+  count: number;
+  firstT: number | null;
+  lastT: number | null;
+  gaps: CoverageGap[];
+}
+
+export interface ArchiveStats {
+  count: number;
+  oldestT: number | null;
+  /** Whole buffer database on disk (upper bound for the archive). */
+  sizeBytes: number;
 }
 
 export interface TrackerState {
@@ -67,12 +118,33 @@ export interface LocationRecord {
   mock: boolean;
 }
 
+/** Result of `exportArchive()`: archived rows newer than the given cursor. */
+export interface ExportResult {
+  rows: LocationRecord[];
+  /** New cursor to pass as `sinceId` next time (unchanged from the input if `rows` is empty). */
+  lastId: number;
+}
+
+/** Result of `getOemAutostartInfo()`: whether this device needs an autostart prompt. */
+export interface OemAutostartInfo {
+  manufacturer: string;
+  hasKnownSettings: boolean;
+}
+
+/** Result of `openAutostartSettings()`: whether a known OEM screen was reached. */
+export interface OemAutostartResult {
+  attempted: boolean;
+  manufacturer: string;
+}
+
 export interface TrackerEvent {
   e: EventType;
   t: number;
   l?: number;
   g?: number;
   b?: number;
+  /** Reason, present on SERVICE_STARTED / SERVICE_STOPPED only. */
+  r?: string;
 }
 
 export interface SyncError {

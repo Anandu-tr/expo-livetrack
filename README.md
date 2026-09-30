@@ -94,6 +94,10 @@ import { LiveTracker } from 'expo-livetrack';
 | `requestPermissions()` | `Promise<TrackerState>` | Request location permissions; resolves with the updated state. |
 | `ensureNotKilled()` | `Promise<void>` | Re-arm the service if the OS killed it; nudge the user about battery optimisation if needed. Throttled (max once per 10 min) and capped (max 3 consecutive attempts) to prevent prompt loops on devices where the OS doesn't reliably reflect the grant. |
 | `requestEnableLocation()` | `Promise<boolean>` | Ask the OS to enable location services. Resolves `true` if they end up enabled. Call this from **your own** `LOCATION_OFF` handler. |
+| `replay(fromMs, toMs)` | `Promise<ReplayResult>` | Re-send archived location rows captured in `[fromMs, toMs)` with their **original** ids and times. Needs `archiveDays > 0`. Rejects with `ERR_REPLAY_AUTH` / `ERR_REPLAY_BUSY`. |
+| `getCoverage(fromMs, toMs, gapMs?)` | `Promise<DayCoverage>` | What this device captured in the window (archive ∪ still-unsynced buffer): count, first/last time, gaps longer than `gapMs` (default 10 min) with distance covered meanwhile. |
+| `clearArchive()` | `Promise<void>` | Delete the on-device archive. Call on sign-out. |
+| `getArchiveStats()` | `Promise<ArchiveStats>` | Archived row count, oldest timestamp, approximate on-disk size. |
 | `onLocation(cb)` | `EventSubscription` | Subscribe to per-record location fixes. |
 | `onEvent(cb)` | `EventSubscription` | Subscribe to lifecycle/diagnostic events. |
 | `onSyncError(cb)` | `EventSubscription` | Subscribe to upload failures. |
@@ -109,7 +113,13 @@ interface StartConfig {
   token: string;   // sent as `Authorization: Bearer <token>`
   userId: string;  // identifies the tracked user; stamped on every record (`u`)
   cadence?: Cadence;
+  archiveDays?: number; // default 0 (off). Keep acknowledged location rows on-device for N days (max 365, 400k rows)
 }
+
+interface ReplayResult { sent: number; accepted: number; batches: number; failedBatches: number }
+interface CoverageGap { fromT: number; toT: number; durationMs: number; distanceM: number }
+interface DayCoverage { count: number; firstT: number | null; lastT: number | null; gaps: CoverageGap[] }
+interface ArchiveStats { count: number; oldestT: number | null; sizeBytes: number }
 
 interface Cadence {
   movingIntervalMs?: number; // default 12000
@@ -210,6 +220,13 @@ to dedupe (e.g. by `(u, t)`) so retried records don't create duplicates.
 Ids you return are **intersected with the ids the client sent**. Returning your own
 primary keys instead of echoing the client's `id` acknowledges nothing, and the
 batch will be retried.
+
+**Archive + replay:** with `archiveDays > 0`, acknowledged location rows are also
+copied to a local `archived_points` table (rolling window). `replay(fromMs, toMs)`
+re-POSTs those rows to the same `url` with their **original** `id` and `t`. The
+server MUST treat a repeated `(u, id)` / `(u, t)` as idempotent (upsert, and still
+return the id in `acceptedIds`) and MUST NOT re-add distance to derived daily
+summaries on a replay.
 
 **Tolerated response variants.** The shape above is the contract, but the parser
 also accepts these so a non-conforming backend degrades instead of stalling:
