@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.Sensor
@@ -14,6 +16,9 @@ import android.hardware.SensorManager
 import android.hardware.TriggerEvent
 import android.hardware.TriggerEventListener
 import android.location.Location
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -24,6 +29,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.ActivityRecognitionResult
 import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionRequest
@@ -43,7 +49,9 @@ import expo.modules.livetrack.buffer.PointEntity
 import expo.modules.livetrack.capture.GateStats
 import expo.modules.livetrack.capture.LocationGate
 import expo.modules.livetrack.keepalive.KillStats
+import expo.modules.livetrack.keepalive.ProcessExits
 import expo.modules.livetrack.keepalive.Watchdog
+import expo.modules.livetrack.sync.OfflineTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -199,6 +207,15 @@ class TrackingService : Service() {
     }
   }
 
+  // --- Phone switched off / internet on-off ---------------------------------
+  // Shutdown: recorded from the system's power-off broadcast while we still can;
+  // the row uploads after the next boot.
+  private var shutdownReceiver: BroadcastReceiver? = null
+  @Volatile private var shutdownLogged = false
+  // Internet: debounced NET_OFF / NET_ON heartbeats from the default network.
+  private var networkCallback: ConnectivityManager.NetworkCallback? = null
+  private var offlineTracker: OfflineTracker? = null
+
   // Runtime-registered so PROVIDERS_CHANGED is reliably delivered while we're
   // alive (manifest delivery of this implicit broadcast is often suppressed).
   private var providerReceiver: expo.modules.livetrack.ProviderReceiver? = null
@@ -284,7 +301,17 @@ class TrackingService : Service() {
     startLocationUpdates()
     requestActivityUpdates()
     registerProviderReceiver()
+    registerShutdownReceiver()
+    registerNetworkCallback()
     if (KillStats.isKillRecovery(reason)) recordKillRestart()
+    // How the previous process ended (force-stop, OS/OEM kill), as rows at the
+    // real time of death.
+    if (lifecycleEventsOn) {
+      scope.launch {
+        runCatching { ProcessExits.recordNew(applicationContext, dao) }
+        runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext) }
+      }
+    }
     bufferLifecycleEvent("SERVICE_STARTED", reason)
     maintenanceHandler.removeCallbacks(maintenanceTick)
     maintenanceHandler.postDelayed(maintenanceTick, MAINTENANCE_TICK_MS)
@@ -296,6 +323,105 @@ class TrackingService : Service() {
     val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
     val updated = KillStats.record(prefs.getString(Prefs.KEY_KILL_RESTARTS, null), System.currentTimeMillis())
     prefs.edit().putString(Prefs.KEY_KILL_RESTARTS, updated).apply()
+  }
+
+  /**
+   * Phone switched off: the system's power-off broadcast (and OEM quick-power-off
+   * variants) reaches this receiver while the service runs. The row is written
+   * synchronously and uploads after the next boot.
+   */
+  private fun registerShutdownReceiver() {
+    if (shutdownReceiver != null) return
+    val receiver = object : BroadcastReceiver() {
+      override fun onReceive(context: Context, intent: Intent?) {
+        if (shutdownLogged) return
+        shutdownLogged = true
+        // Blocking on purpose: the device powers off right after, so the held fix
+        // and the stop marker must be in SQLite before onReceive returns.
+        flushGate(blocking = true)
+        bufferLifecycleEvent("SERVICE_STOPPED", "shutdown", blocking = true)
+      }
+    }
+    val filter = IntentFilter(Intent.ACTION_SHUTDOWN).apply {
+      addAction("android.intent.action.QUICKBOOT_POWEROFF")
+      addAction("com.htc.intent.action.QUICKBOOT_POWEROFF")
+    }
+    // Exported: the OEM quick-power-off broadcasts don't come from the system
+    // UID. ACTION_SHUTDOWN itself is protected (system-only).
+    shutdownReceiver = runCatching {
+      ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+      receiver
+    }.getOrNull()
+  }
+
+  private fun unregisterShutdownReceiver() {
+    shutdownReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+    shutdownReceiver = null
+  }
+
+  private fun registerNetworkCallback() {
+    if (networkCallback != null) return
+    val cm = getSystemService(ConnectivityManager::class.java) ?: return
+    val lastOnline = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).getBoolean(Prefs.KEY_LAST_ONLINE, true)
+    offlineTracker = OfflineTracker(lastOnline, NET_OFF_CONFIRM_MS)
+    val callback = object : ConnectivityManager.NetworkCallback() {
+      // Delivered on a connectivity thread; hop to the main looper like every
+      // other callback in this class.
+      override fun onAvailable(network: Network) { maintenanceHandler.post { checkNetwork() } }
+      override fun onLost(network: Network) { maintenanceHandler.post { checkNetwork() } }
+      override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        maintenanceHandler.post { checkNetwork() }
+      }
+    }
+    networkCallback = runCatching {
+      cm.registerDefaultNetworkCallback(callback)
+      callback
+    }.getOrNull()
+    checkNetwork() // an outage already in progress is timed from now
+  }
+
+  private fun unregisterNetworkCallback() {
+    networkCallback?.let { cb ->
+      runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
+    }
+    networkCallback = null
+    offlineTracker = null
+  }
+
+  /** Feed the current internet state to the tracker; record NET_OFF / NET_ON transitions. */
+  private fun checkNetwork() {
+    val tracker = offlineTracker ?: return
+    val change = tracker.update(DeviceStateEvents.isOnline(this), System.currentTimeMillis()) ?: return
+    getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).edit()
+      .putBoolean(Prefs.KEY_LAST_ONLINE, tracker.recordedOnline).apply()
+    when (change) {
+      is OfflineTracker.Change.Off -> bufferNetworkEvent("NET_OFF", change.since)
+      is OfflineTracker.Change.On -> bufferNetworkEvent("NET_ON", change.at)
+    }
+  }
+
+  /**
+   * HEARTBEAT row with `r` = NET_OFF / NET_ON at [t] (an existing event type,
+   * so the ingest backend accepts it). Opt-in with the lifecycle diagnostics.
+   * Uploads once the phone is back online.
+   */
+  private fun bufferNetworkEvent(r: String, t: Long) {
+    if (!lifecycleEventsOn) return
+    val row = PointEntity(
+      userId = userId,
+      t = t,
+      lat = lastLat,
+      lng = lastLng,
+      batt = readBattery().first,
+      act = r,
+      eventType = "HEARTBEAT",
+    )
+    scope.launch {
+      runCatching { dao.insert(row) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(network) failed", mapOf("hasLocation" to "false"))
+      }
+    }
+    runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext) }
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) {
@@ -321,10 +447,13 @@ class TrackingService : Service() {
       removeActivityUpdates()
     }
     unregisterProviderReceiver()
+    unregisterShutdownReceiver()
+    unregisterNetworkCallback()
     // Blocking on purpose: the coroutine scope is cancelled right after, and the
     // held fix + stop marker must land in SQLite before the process goes away.
     flushGate(blocking = true)
-    bufferLifecycleEvent("SERVICE_STOPPED", "destroy", blocking = true)
+    // A shutdown already wrote its own stop marker.
+    if (!shutdownLogged) bufferLifecycleEvent("SERVICE_STOPPED", "destroy", blocking = true)
     scope.cancel()
     super.onDestroy()
   }
@@ -900,6 +1029,9 @@ class TrackingService : Service() {
   private fun maintenance() {
     // Cheap reads; writes and records only when something changed.
     DeviceStateEvents.reconcileAsync(applicationContext)
+    // Lets a sustained outage reach its confirmation time without waiting for
+    // another connectivity callback.
+    checkNetwork()
     val now = SystemClock.elapsedRealtime()
     val arSilent = now - maxOf(lastArResultAt, startedAt) > AR_SILENCE_MS
     if (arSilent && now - lastArReregisterAt > AR_REREGISTER_INTERVAL_MS) {
@@ -1063,6 +1195,9 @@ class TrackingService : Service() {
 
     private const val MAINTENANCE_TICK_MS = 60_000L
     private const val STATS_INTERVAL_MS = 10 * 60_000L
+    // No working internet for this long counts as an outage (NET_OFF), timed from
+    // its start; Wi-Fi / mobile handovers drop connectivity for seconds.
+    private const val NET_OFF_CONFIRM_MS = 2 * 60_000L
 
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
     const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"

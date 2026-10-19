@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -113,6 +115,17 @@ internal object DeviceStateEvents {
       true // pre-Q: foreground grant covers background.
     }
     return if (background) "granted" else "background"
+  }
+
+  /**
+   * Whether the default network actually reaches the internet (validated), not
+   * merely "connected": mobile data with no balance or a captive Wi-Fi is offline.
+   */
+  fun isOnline(ctx: Context): Boolean {
+    val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return true
+    val caps = runCatching { cm.getNetworkCapabilities(cm.activeNetwork) }.getOrNull() ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+      caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
   }
 
   fun isBatteryOptIgnored(ctx: Context): Boolean {

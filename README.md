@@ -159,6 +159,8 @@ Each event is `{ e: EventType, t: number, l?, g?, b? }`. `EventType` is one of:
 | `PERMISSION_GRANTED` | Location permission was granted. |
 | `MOCK_DETECTED` | A mock/spoofed location provider was detected. |
 | `BATTERY_OPT_ON` | Battery optimisation is active (may freeze tracking). |
+| *(stops)* | With `diagnostics.lifecycleEvents`, `SERVICE_STOPPED` also records **phone switched off** (`r: "shutdown"`, written at power-off and uploaded after the next boot) and, on Android 11+, how the previous process ended, at its real time, read on the next start: **force-stop** (`r: "force_stop"`) or an OS/OEM kill (`r: "killed_low_memory"`, `"killed_other:<description>"`, …). |
+| *(internet)* | With `diagnostics.lifecycleEvents`, a `HEARTBEAT` with `r: "NET_OFF"` when the phone has had no working internet for 2 min (its `t` is when the outage began) and `r: "NET_ON"` when it is back. Both upload once online. |
 | *(reconciled)* | `LOCATION_ON/OFF`, `PERMISSION_GRANTED/REVOKED` and `BATTERY_OPT_ON` are also checked on every service start and once a minute while tracking, so a change made while the service was dead or the app was closed is still recorded. Such a row carries `r: "reconcile"` and its `t` is when it was noticed, not when it happened. |
 | `HEARTBEAT` | Periodic liveness signal from the service. Stored rows carry `r`: `STILL` (still per Activity Recognition), `STILL_NOAR` (still inferred from speed because Activity Recognition was silent for 15 min), or `STATS\|m=..\|ar=..\|d=..\|...` every 10 min when `diagnostics.lifecycleEvents` is on (fix deliveries, gate rejects by reason, probes, minutes since the last Activity Recognition result). |
 

@@ -66,4 +66,10 @@ object Prefs {
 
   /** Recent kill-recovery start times, see [expo.modules.livetrack.keepalive.KillStats]. */
   const val KEY_KILL_RESTARTS = "killRestarts"
+
+  /** Newest process-exit time already recorded, see [expo.modules.livetrack.keepalive.ProcessExits]. */
+  const val KEY_LAST_EXIT_TS = "lastExitTs"
+
+  /** Last reported internet state (NET_ON/NET_OFF heartbeats), see [expo.modules.livetrack.sync.OfflineTracker]. */
+  const val KEY_LAST_ONLINE = "lastOnline"
 }
