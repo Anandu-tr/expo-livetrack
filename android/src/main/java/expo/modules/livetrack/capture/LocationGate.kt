@@ -20,6 +20,9 @@ import kotlin.math.sqrt
  *    cannot catch these; an implied-speed gate plus a zig-zag lookahead can.
  *  - Stationary jitter: a parked device wanders 10–40 m and paints a blob.
  *  - Cached / out-of-order fixes after a service restart.
+ *  - (Oct 2026) A parked phone polled indoors gets fixes claiming speed 0 and
+ *    ~10 m accuracy that land 300-1000 m away; every one passed the speed check
+ *    and the map drew a starburst. Such jumps now need confirmation.
  *
  * Model: every accepted fix is HELD for one cycle so the next fix can vote on
  * whether it was a spur (zig-zag). The previously held fix is RELEASED when the
@@ -47,11 +50,20 @@ class LocationGate<T>(
    *   clock change, cold boot before time sync) makes every later fix look
    *   "out-of-order" forever, since only acceptance advances the anchor and
    *   acceptance is exactly what a negative dt blocks.
+   * @param speedMps the fix's own reported speed, or null when it reports none
+   *   (network-derived fixes usually don't). See [UNCONFIRMED_MIN_JUMP_M].
    */
-  data class Fix(val lat: Double, val lng: Double, val acc: Double, val t: Long, val monotonicT: Long)
+  data class Fix(
+    val lat: Double,
+    val lng: Double,
+    val acc: Double,
+    val t: Long,
+    val monotonicT: Long,
+    val speedMps: Double? = null,
+  )
 
   sealed class Outcome<out T> {
-    /** Dropped. `reason` is one of accuracy|stale|out-of-order|teleport|jitter|zigzag. */
+    /** Dropped. `reason` is one of accuracy|stale|out-of-order|teleport|jitter|unconfirmed|zigzag. */
     data class Reject(val reason: String) : Outcome<Nothing>()
 
     /** Accepted and held for the zig-zag lookahead; nothing to write yet. */
@@ -79,11 +91,15 @@ class LocationGate<T>(
   /** Monotonic time base for dt. Advances on accept and on every Snap. */
   private var anchorMonotonicT: Long = 0L
 
-  // Re-anchor candidate for the teleport gate.
+  // Re-anchor candidate, shared by the teleport and unconfirmed-jump gates: both
+  // mean "far from the anchor", and agreeing fixes are the cure for either.
   private var cLat = 0.0
   private var cLng = 0.0
   private var cMonotonicT = 0L
   private var cCount = 0
+
+  /** Monotonic time of the last fix whose own speed proved motion; null = none yet. */
+  private var lastMotionMonotonicT: Long? = null
 
   /** The fix everything is measured against: the held one if any, else the last released. */
   private val anchor: Fix?
@@ -92,6 +108,7 @@ class LocationGate<T>(
   fun evaluate(fix: Fix, ageMs: Long, payload: T): Outcome<T> {
     if (fix.acc.isNaN() || fix.acc < 0.0 || fix.acc > maxAccuracyM) return Outcome.Reject("accuracy")
     if (ageMs > MAX_FIX_AGE_MS) return Outcome.Reject("stale")
+    if ((fix.speedMps ?: 0.0) >= MOTION_SPEED_MPS) lastMotionMonotonicT = fix.monotonicT
 
     val a = anchor
     if (a == null) {
@@ -110,23 +127,11 @@ class LocationGate<T>(
       // Allowed distance grows with dt, so a wrong anchor D metres away releases by
       // itself after D / MAX_SPEED_MPS seconds. The candidate counter releases it
       // sooner when several consecutive fixes agree on the new place.
-      if (cCount > 0 && fix.monotonicT > cMonotonicT && haversineM(cLat, cLng, fix.lat, fix.lng) <= REANCHOR_RADIUS_M) {
-        cCount++
-      } else {
-        cLat = fix.lat
-        cLng = fix.lng
-        cCount = 1
-      }
-      cMonotonicT = fix.monotonicT
-      if (cCount >= REANCHOR_COUNT) {
-        cCount = 0
-        return accept(fix, payload, d)
-      }
-      return Outcome.Reject("teleport")
+      return if (confirmCandidate(fix)) accept(fix, payload, d) else Outcome.Reject("teleport")
     }
-    cCount = 0
 
     if (d < max(movingDistanceM, fix.acc)) {
+      cCount = 0
       if (dt >= keepaliveMs) {
         anchorMonotonicT = fix.monotonicT
         val h = held
@@ -141,7 +146,47 @@ class LocationGate<T>(
       return Outcome.Reject("jitter")
     }
 
+    if (isUnconfirmedJump(fix, d)) {
+      return if (confirmCandidate(fix)) accept(fix, payload, d) else Outcome.Reject("unconfirmed")
+    }
+    cCount = 0
+
     return accept(fix, payload, d)
+  }
+
+  /**
+   * A big jump from a fix that reports no motion of its own, with no recent fix
+   * that did. A parked phone indoors produces exactly this: fixes claiming
+   * speed 0 and 10 m accuracy while landing 300-1000 m away. The speed gate
+   * can't catch them because its allowance grows with time since the last
+   * accepted fix. Genuine moves either carry speed (GNSS) or repeat at the new
+   * place, which [confirmCandidate] accepts.
+   */
+  private fun isUnconfirmedJump(fix: Fix, d: Double): Boolean {
+    val reportsNoMotion = fix.speedMps == null || fix.speedMps < STILL_SPEED_MPS
+    val recentMotion = lastMotionMonotonicT?.let { fix.monotonicT - it <= MOTION_MEMORY_MS } ?: false
+    return reportsNoMotion && !recentMotion &&
+      d > max(UNCONFIRMED_MIN_JUMP_M, UNCONFIRMED_ACC_FACTOR * fix.acc)
+  }
+
+  /**
+   * Count [fix] towards the re-anchor candidate; true once [REANCHOR_COUNT]
+   * consecutive far fixes agreed within [REANCHOR_RADIUS_M].
+   */
+  private fun confirmCandidate(fix: Fix): Boolean {
+    if (cCount > 0 && fix.monotonicT > cMonotonicT && haversineM(cLat, cLng, fix.lat, fix.lng) <= REANCHOR_RADIUS_M) {
+      cCount++
+    } else {
+      cLat = fix.lat
+      cLng = fix.lng
+      cCount = 1
+    }
+    cMonotonicT = fix.monotonicT
+    if (cCount >= REANCHOR_COUNT) {
+      cCount = 0
+      return true
+    }
+    return false
   }
 
   /**
@@ -201,6 +246,23 @@ class LocationGate<T>(
 
     /** Agreement radius for the re-anchor candidate. */
     const val REANCHOR_RADIUS_M = 150.0
+
+    /** Below this reported speed a fix claims to be stationary (GNSS jitter sits under it). */
+    const val STILL_SPEED_MPS = 0.5
+
+    /** A fix reporting at least this speed proves motion (brisk walk / any vehicle). */
+    const val MOTION_SPEED_MPS = 2.0
+
+    /** How long proven motion vouches for later speed-less fixes (network fixes mid-drive). */
+    const val MOTION_MEMORY_MS = 60_000L
+
+    /**
+     * A stationary-claiming fix further than max(this, [UNCONFIRMED_ACC_FACTOR] x acc)
+     * from the anchor needs confirmation. 75 m sits above normal GNSS wander and
+     * below the 300-1000 m scatter seen in production.
+     */
+    const val UNCONFIRMED_MIN_JUMP_M = 75.0
+    const val UNCONFIRMED_ACC_FACTOR = 3.0
 
     /** A→B and B→C must both exceed this for B to be a zig-zag spur... */
     const val ZIGZAG_LEG_M = 100.0

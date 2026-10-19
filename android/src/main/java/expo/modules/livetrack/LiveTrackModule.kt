@@ -1,6 +1,7 @@
 package expo.modules.livetrack
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -26,7 +27,9 @@ import expo.modules.livetrack.archive.ReplayRunner
 import expo.modules.livetrack.buffer.ArchivedPointEntity
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointEntity
+import expo.modules.livetrack.keepalive.KillStats
 import expo.modules.livetrack.keepalive.Watchdog
+import expo.modules.livetrack.oem.OemAutostart
 import expo.modules.livetrack.sync.TokenProviders
 import expo.modules.livetrack.sync.UploadWorker
 import java.io.File
@@ -167,6 +170,7 @@ class LiveTrackModule : Module() {
             putBoolean("locationServices", isLocationEnabled(ctx))
             putBoolean("batteryOptIgnored", isBatteryOptIgnored(ctx))
             putInt("bufferedCount", bufferedCount)
+            putInt("killRestarts24h", killRestarts24h(ctx))
           }
           promise.resolve(state)
         }.onFailure { promise.reject("ERR_GET_STATE", it.message, it) }
@@ -504,12 +508,47 @@ class LiveTrackModule : Module() {
     AsyncFunction("getOemAutostartInfo") { promise: Promise ->
       runCatching {
         val manufacturer = Build.MANUFACTURER ?: ""
+        val brand = Build.BRAND ?: ""
         mapOf(
           "manufacturer" to manufacturer,
-          "hasKnownSettings" to expo.modules.livetrack.oem.OemAutostart.isKnownAggressiveOem(manufacturer),
+          "brand" to brand,
+          "hasKnownSettings" to OemAutostart.isKnownAggressiveOem(manufacturer, brand),
+          "hasBatterySaverSettings" to OemAutostart.isXiaomiFamily(manufacturer, brand),
         )
       }.onSuccess { promise.resolve(it) }
         .onFailure { promise.reject("ERR_OEM_AUTOSTART_INFO", it.message, it) }
+    }
+
+    // openBatterySaverSettings(): MIUI/HyperOS per-app battery saver, where
+    // "No restrictions" stops MIUI killing the tracker (production: a POCO with
+    // it unset was killed ~every 30 min, round the clock). Falls back to the
+    // app-info screen, which on MIUI links to the same setting.
+    AsyncFunction("openBatterySaverSettings") { promise: Promise ->
+      runCatching {
+        val ctx = context
+        val manufacturer = Build.MANUFACTURER ?: ""
+        var attempted = false
+        if (OemAutostart.isXiaomiFamily(manufacturer, Build.BRAND ?: "")) {
+          val label = runCatching { ctx.applicationInfo.loadLabel(ctx.packageManager).toString() }
+            .getOrDefault(ctx.packageName)
+          val miui = Intent(OemAutostart.MIUI_BATTERY_SAVER_ACTION).apply {
+            component = ComponentName(OemAutostart.MIUI_BATTERY_SAVER_PACKAGE, OemAutostart.MIUI_BATTERY_SAVER_CLASS)
+            putExtra(OemAutostart.MIUI_EXTRA_PACKAGE_NAME, ctx.packageName)
+            putExtra(OemAutostart.MIUI_EXTRA_PACKAGE_LABEL, label)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+          attempted = runCatching { ctx.startActivity(miui) }.isSuccess
+        }
+        if (!attempted) {
+          val fallback = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:${ctx.packageName}"),
+          ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+          runCatching { ctx.startActivity(fallback) }
+        }
+        mapOf("attempted" to attempted, "manufacturer" to manufacturer)
+      }.onSuccess { promise.resolve(it) }
+        .onFailure { promise.reject("ERR_OEM_BATTERY_SAVER_OPEN", it.message, it) }
     }
 
     // openAutostartSettings(): best-effort launch of this OEM's autostart
@@ -521,7 +560,7 @@ class LiveTrackModule : Module() {
       runCatching {
         val ctx = context
         val manufacturer = Build.MANUFACTURER ?: ""
-        val candidates = expo.modules.livetrack.oem.OemAutostart.candidatesFor(manufacturer)
+        val candidates = OemAutostart.candidatesFor(manufacturer, Build.BRAND ?: "")
         var attempted = false
         for (component in candidates) {
           val intent = Intent().apply {
@@ -563,6 +602,7 @@ class LiveTrackModule : Module() {
           putBoolean("locationServices", isLocationEnabled(ctx))
           putBoolean("batteryOptIgnored", isBatteryOptIgnored(ctx))
           putInt("bufferedCount", bufferedCount)
+          putInt("killRestarts24h", killRestarts24h(ctx))
         }
         promise.resolve(state)
       }.onFailure { promise.reject("ERR_REQUEST_PERMISSIONS", it.message, it) }
@@ -585,6 +625,13 @@ class LiveTrackModule : Module() {
     // here means "foreground-only / needs background upgrade".
     return if (background) "granted" else "background"
   }
+
+  /** Silent-kill recoveries of the tracking service in the last 24 h (see [KillStats]). */
+  private fun killRestarts24h(ctx: Context): Int =
+    KillStats.count(
+      ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(Prefs.KEY_KILL_RESTARTS, null),
+      System.currentTimeMillis(),
+    )
 
   private fun isLocationEnabled(ctx: Context): Boolean {
     val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return false

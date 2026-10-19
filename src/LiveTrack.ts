@@ -88,6 +88,15 @@ export const LiveTracker = {
   },
 
   /**
+   * Android, Xiaomi/POCO/Redmi: open the MIUI per-app battery saver, where
+   * "No restrictions" stops MIUI from killing tracking in the background.
+   * Falls back to the app-info screen elsewhere or if the screen isn't found.
+   */
+  openBatterySaverSettings(): Promise<OemAutostartResult> {
+    return LiveTrackModule.openBatterySaverSettings();
+  },
+
+  /**
    * Ask the OS to enable location services. Thin pass-through to native.
    *
    * NOTE: This package never shows a popup on its own. The host app decides

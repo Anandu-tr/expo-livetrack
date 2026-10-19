@@ -7,6 +7,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.math.cos
 
 /**
  * Executable spec for [LocationGate]. Plain JUnit — no Android on the classpath.
@@ -22,13 +23,24 @@ class LocationGateTest {
 
   private fun gate() = LocationGate<String>(movingDistanceM = 20.0, maxAccuracyM = 35.0, keepaliveMs = 120_000L)
 
-  private fun fix(dLatM: Double, dtS: Double, acc: Double = 10.0, monotonicDtS: Double = dtS) =
+  /** A real GNSS fix while moving reports a speed; the pre-existing cases model that. */
+  private val movingSpeed = 5.0
+
+  private fun fix(
+    dLatM: Double,
+    dtS: Double,
+    acc: Double = 10.0,
+    monotonicDtS: Double = dtS,
+    speed: Double? = movingSpeed,
+    dLngM: Double = 0.0,
+  ) =
     Fix(
       lat0 + dLatM / 111_000.0,
-      lng0,
+      lng0 + dLngM / (111_000.0 * cos(Math.toRadians(lat0))),
       acc,
       t0 + (dtS * 1000).toLong(),
       t0 + (monotonicDtS * 1000).toLong(),
+      speed,
     )
 
   private fun <T> LocationGate<T>.eval(f: Fix, payload: T, ageMs: Long = 0L) = evaluate(f, ageMs, payload)
@@ -212,6 +224,70 @@ class LocationGateTest {
     val out = g.eval(fix(260.0, 30.0), "d")
     assertTrue(out is Outcome.Release)
     assertEquals("c", (out as Outcome.Release).payload)
+  }
+
+  // --- unconfirmed jumps (stationary scatter) -------------------------------
+  // Production, Oct 2026: with Activity Recognition silent the service polled
+  // every 10 s indoors and got fixes reporting speed 0 / no speed and 7-17 m
+  // accuracy that were really 300-1000 m off. Each passed the speed check
+  // because the allowance grows with time since the last accepted fix.
+
+  @Test fun zeroSpeedScatterAroundAParkedPhoneIsNeverAccepted() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "home")
+    // Pairwise > 150 m apart, so the re-anchor counter never gets 3 agreeing.
+    val scatter = listOf(
+      Triple(400.0, 0.0, 30.0), Triple(-150.0, 600.0, 75.0), Triple(-700.0, -200.0, 110.0),
+      Triple(300.0, -800.0, 150.0), Triple(850.0, 300.0, 210.0), Triple(-400.0, -650.0, 260.0),
+      Triple(100.0, 950.0, 330.0), Triple(-900.0, 250.0, 380.0),
+    )
+    scatter.forEachIndexed { i, (dLat, dLng, dt) ->
+      val speed = if (i % 2 == 0) 0.0 else null
+      val out = g.eval(fix(dLat, dt, acc = 7.0 + i, speed = speed, dLngM = dLng), "s$i")
+      assertTrue("scatter fix $i must be rejected, was $out", out is Outcome.Reject)
+    }
+    // The real position is still the anchor: a fix back home is jitter / keepalive.
+    val back = g.eval(fix(5.0, 400.0, speed = 0.0), "back")
+    assertTrue(back is Outcome.Release || back is Outcome.Snap)
+  }
+
+  @Test fun relocationWithoutSpeedIsAcceptedOnTheThirdAgreeingFix() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(600.0, 60.0, speed = null), "p2"))
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(620.0, 120.0, speed = null), "p3"))
+    val out = g.eval(fix(610.0, 180.0, speed = null), "p4")
+    assertTrue(out is Outcome.Release)
+    assertEquals("p1", (out as Outcome.Release).payload)
+  }
+
+  @Test fun zeroSpeedFixRightAfterMotionIsAccepted() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 8.0), "p1")
+    // A network fix mid-drive: no speed of its own, but the phone was just moving.
+    val out = g.eval(fix(150.0, 15.0, speed = null), "p2")
+    assertTrue(out is Outcome.Release)
+  }
+
+  @Test fun zeroSpeedJumpLongAfterMotionNeedsConfirmation() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 8.0), "p1")
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(400.0, 120.0, speed = 0.0), "p2"))
+  }
+
+  @Test fun walkingSpeedIsNotTreatedAsStationary() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
+    val out = g.eval(fix(100.0, 80.0, speed = 1.2), "p2")
+    assertTrue(out is Outcome.Release)
+  }
+
+  @Test fun shortZeroSpeedMoveWithinAccuracyBandIsNotUnconfirmed() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
+    // 60 m with 25 m accuracy: below max(75 m, 3 x acc) — an ordinary small move.
+    val out = g.eval(fix(60.0, 30.0, acc = 25.0, speed = 0.0), "p2")
+    assertTrue(out is Outcome.Release)
   }
 
   // --- displacement reporting for still-mode exit --------------------------

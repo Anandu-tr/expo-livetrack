@@ -17,6 +17,15 @@ enum LocationGateLimits {
   static let zigzagLegM = 100.0
   /// ...while A→C stays within this.
   static let zigzagReturnM = 40.0
+  /// Below this reported speed a fix claims to be stationary.
+  static let stillSpeedMps = 0.5
+  /// A fix reporting at least this speed proves motion.
+  static let motionSpeedMps = 2.0
+  /// How long proven motion vouches for later speed-less fixes.
+  static let motionMemoryMs: Int64 = 60_000
+  /// A stationary-claiming fix further than max(this, factor x acc) needs confirmation.
+  static let unconfirmedMinJumpM = 75.0
+  static let unconfirmedAccFactor = 3.0
 
   private static let earthRadiusM = 6_371_000.0
 
@@ -41,15 +50,17 @@ enum LocationGateLimits {
 final class LocationGate<T> {
 
   /// Minimal view of a fix; `acc < 0` means "no accuracy reported".
+  /// `speedMps` is the fix's own reported speed, nil when it reports none.
   struct Fix {
     let lat: Double
     let lng: Double
     let acc: Double
     let t: Int64
+    var speedMps: Double? = nil
   }
 
   enum Outcome {
-    /// Dropped. Reason is one of accuracy|stale|out-of-order|teleport|jitter|zigzag.
+    /// Dropped. Reason is one of accuracy|stale|out-of-order|teleport|jitter|unconfirmed|zigzag.
     case reject(String)
     /// Accepted and held for the zig-zag lookahead; nothing to write yet.
     case hold(displacementM: Double)
@@ -76,6 +87,8 @@ final class LocationGate<T> {
   private var cLng = 0.0
   private var cT: Int64 = 0
   private var cCount = 0
+  /// Time of the last fix whose own speed proved motion.
+  private var lastMotionT: Int64?
 
   init(movingDistanceM: Double, maxAccuracyM: Double, keepaliveMs: Double) {
     self.movingDistanceM = movingDistanceM
@@ -88,6 +101,7 @@ final class LocationGate<T> {
   func evaluate(fix: Fix, ageMs: Double, payload: T) -> Outcome {
     if fix.acc.isNaN || fix.acc < 0 || fix.acc > maxAccuracyM { return .reject("accuracy") }
     if ageMs > LocationGateLimits.maxFixAgeMs { return .reject("stale") }
+    if (fix.speedMps ?? 0) >= LocationGateLimits.motionSpeedMps { lastMotionT = fix.t }
 
     guard let a = anchor else {
       held = Held(fix: fix, payload: payload)
@@ -102,24 +116,11 @@ final class LocationGate<T> {
     let speed = d / (Double(max(dt, LocationGateLimits.minDtMs)) / 1000.0)
 
     if speed > LocationGateLimits.maxSpeedMps {
-      if cCount > 0, fix.t > cT,
-         LocationGateLimits.haversineM(cLat, cLng, fix.lat, fix.lng) <= LocationGateLimits.reanchorRadiusM {
-        cCount += 1
-      } else {
-        cLat = fix.lat
-        cLng = fix.lng
-        cCount = 1
-      }
-      cT = fix.t
-      if cCount >= LocationGateLimits.reanchorCount {
-        cCount = 0
-        return accept(fix: fix, payload: payload, d: d)
-      }
-      return .reject("teleport")
+      return confirmCandidate(fix) ? accept(fix: fix, payload: payload, d: d) : .reject("teleport")
     }
-    cCount = 0
 
     if d < max(movingDistanceM, fix.acc) {
+      cCount = 0
       if dt >= keepaliveMs {
         anchorT = fix.t
         if let h = held {
@@ -132,7 +133,39 @@ final class LocationGate<T> {
       return .reject("jitter")
     }
 
+    if isUnconfirmedJump(fix, d: d) {
+      return confirmCandidate(fix) ? accept(fix: fix, payload: payload, d: d) : .reject("unconfirmed")
+    }
+    cCount = 0
+
     return accept(fix: fix, payload: payload, d: d)
+  }
+
+  /// A big jump from a fix reporting no motion of its own, with no recent fix that
+  /// did (parked-phone scatter). See the Android gate for the production case.
+  private func isUnconfirmedJump(_ fix: Fix, d: Double) -> Bool {
+    let reportsNoMotion = (fix.speedMps ?? 0) < LocationGateLimits.stillSpeedMps
+    let recentMotion = lastMotionT.map { fix.t - $0 <= LocationGateLimits.motionMemoryMs } ?? false
+    return reportsNoMotion && !recentMotion &&
+      d > max(LocationGateLimits.unconfirmedMinJumpM, LocationGateLimits.unconfirmedAccFactor * fix.acc)
+  }
+
+  /// Count `fix` towards the re-anchor candidate; true once enough agree.
+  private func confirmCandidate(_ fix: Fix) -> Bool {
+    if cCount > 0, fix.t > cT,
+       LocationGateLimits.haversineM(cLat, cLng, fix.lat, fix.lng) <= LocationGateLimits.reanchorRadiusM {
+      cCount += 1
+    } else {
+      cLat = fix.lat
+      cLng = fix.lng
+      cCount = 1
+    }
+    cT = fix.t
+    if cCount >= LocationGateLimits.reanchorCount {
+      cCount = 0
+      return true
+    }
+    return false
   }
 
   /// Release the held fix, if any, without waiting for a successor.

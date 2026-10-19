@@ -34,10 +34,34 @@ object OemAutostart {
     ),
   )
 
+  /** Sub-brands that run their parent's ROM (POCO and Redmi phones run MIUI/HyperOS). */
+  private val BRAND_PARENT = mapOf("poco" to "xiaomi", "redmi" to "xiaomi")
+
   /** @param manufacturer typically `Build.MANUFACTURER`, case-insensitive. */
   fun candidatesFor(manufacturer: String): List<ComponentName> =
     CANDIDATES[manufacturer.trim().lowercase()] ?: emptyList()
 
+  /** As [candidatesFor], falling back to `Build.BRAND` for sub-brands. */
+  fun candidatesFor(manufacturer: String, brand: String): List<ComponentName> =
+    candidatesFor(manufacturer).ifEmpty { candidatesFor(BRAND_PARENT[brand.trim().lowercase()] ?: "") }
+
   fun isKnownAggressiveOem(manufacturer: String): Boolean =
     candidatesFor(manufacturer).isNotEmpty()
+
+  fun isKnownAggressiveOem(manufacturer: String, brand: String): Boolean =
+    candidatesFor(manufacturer, brand).isNotEmpty()
+
+  /** Xiaomi, POCO or Redmi: the per-app MIUI battery saver applies. */
+  fun isXiaomiFamily(manufacturer: String, brand: String): Boolean =
+    manufacturer.trim().lowercase() == "xiaomi" || BRAND_PARENT[brand.trim().lowercase()] == "xiaomi"
+
+  // MIUI/HyperOS per-app "Battery saver" screen (No restrictions / Battery saver /
+  // Restrict background). Separate from both Autostart and Android's own
+  // battery-optimization exemption, and the setting that decides whether MIUI
+  // kills a background tracker. Undocumented, hence best-effort with fallback.
+  const val MIUI_BATTERY_SAVER_ACTION = "miui.intent.action.HIDDEN_APPS_CONFIG_ACTIVITY"
+  const val MIUI_BATTERY_SAVER_PACKAGE = "com.miui.powerkeeper"
+  const val MIUI_BATTERY_SAVER_CLASS = "com.miui.powerkeeper.ui.HiddenAppsConfigActivity"
+  const val MIUI_EXTRA_PACKAGE_NAME = "package_name"
+  const val MIUI_EXTRA_PACKAGE_LABEL = "package_label"
 }

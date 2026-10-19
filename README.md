@@ -98,6 +98,9 @@ import { LiveTracker } from 'expo-livetrack';
 | `getCoverage(fromMs, toMs, gapMs?)` | `Promise<DayCoverage>` | What this device captured in the window (archive ∪ still-unsynced buffer): count, first/last time, gaps longer than `gapMs` (default 10 min) with distance covered meanwhile. |
 | `clearArchive()` | `Promise<void>` | Delete the on-device archive. Call on sign-out. |
 | `getArchiveStats()` | `Promise<ArchiveStats>` | Archived row count, oldest timestamp, approximate on-disk size. |
+| `getOemAutostartInfo()` | `Promise<OemAutostartInfo>` | Android: `{ manufacturer, brand, hasKnownSettings, hasBatterySaverSettings }`. Whether this phone's maker has its own background-kill settings (Xiaomi/POCO/Redmi, Oppo, Vivo, Realme). |
+| `openAutostartSettings()` | `Promise<OemAutostartResult>` | Android: best-effort launch of the OEM autostart screen; falls back to app info. |
+| `openBatterySaverSettings()` | `Promise<OemAutostartResult>` | Android, Xiaomi/POCO/Redmi: open the MIUI per-app battery saver ("No restrictions" stops MIUI killing tracking); falls back to app info. |
 | `onLocation(cb)` | `EventSubscription` | Subscribe to per-record location fixes. |
 | `onEvent(cb)` | `EventSubscription` | Subscribe to lifecycle/diagnostic events. |
 | `onSyncError(cb)` | `EventSubscription` | Subscribe to upload failures. |
@@ -140,6 +143,7 @@ interface TrackerState {
   locationServices: boolean;
   batteryOptIgnored: boolean;
   bufferedCount: number;
+  killRestarts24h?: number; // Android: silent-kill recoveries in the last 24 h
 }
 ```
 
@@ -155,7 +159,7 @@ Each event is `{ e: EventType, t: number, l?, g?, b? }`. `EventType` is one of:
 | `PERMISSION_GRANTED` | Location permission was granted. |
 | `MOCK_DETECTED` | A mock/spoofed location provider was detected. |
 | `BATTERY_OPT_ON` | Battery optimisation is active (may freeze tracking). |
-| `HEARTBEAT` | Periodic liveness signal from the service. |
+| `HEARTBEAT` | Periodic liveness signal from the service. Stored rows carry `r`: `STILL` (still per Activity Recognition), `STILL_NOAR` (still inferred from speed because Activity Recognition was silent for 15 min), or `STATS\|m=..\|ar=..\|d=..\|...` every 10 min when `diagnostics.lifecycleEvents` is on (fix deliveries, gate rejects by reason, probes, minutes since the last Activity Recognition result). |
 
 ### `LocationRecord` (`onLocation`) and `SyncError` (`onSyncError`)
 

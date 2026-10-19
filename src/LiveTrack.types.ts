@@ -104,6 +104,13 @@ export interface TrackerState {
   locationServices: boolean;
   batteryOptIgnored: boolean;
   bufferedCount: number;
+  /**
+   * Android only: times in the last 24 h the tracking service had to be
+   * recovered after the OS/OEM killed it silently (watchdog, sticky restart or
+   * Activity Recognition restart). A high value means the device's battery
+   * manager (e.g. MIUI "Battery saver") is restricting the app.
+   */
+  killRestarts24h?: number;
 }
 
 export interface LocationRecord {
@@ -128,7 +135,11 @@ export interface ExportResult {
 /** Result of `getOemAutostartInfo()`: whether this device needs an autostart prompt. */
 export interface OemAutostartInfo {
   manufacturer: string;
+  /** `Build.BRAND`, e.g. "POCO" on a Xiaomi-made POCO phone. */
+  brand?: string;
   hasKnownSettings: boolean;
+  /** Xiaomi / POCO / Redmi: `openBatterySaverSettings()` can reach the MIUI per-app battery saver. */
+  hasBatterySaverSettings?: boolean;
 }
 
 /** Result of `openAutostartSettings()`: whether a known OEM screen was reached. */
@@ -143,7 +154,11 @@ export interface TrackerEvent {
   l?: number;
   g?: number;
   b?: number;
-  /** Reason, present on SERVICE_STARTED / SERVICE_STOPPED only. */
+  /**
+   * Reason. SERVICE_STARTED / SERVICE_STOPPED: why. HEARTBEAT (stored rows):
+   * `STILL`, `STILL_NOAR` (still detected from speed because Activity
+   * Recognition was silent) or a `STATS|...` diagnostics summary.
+   */
   r?: string;
 }
 

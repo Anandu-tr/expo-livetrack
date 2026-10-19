@@ -285,7 +285,8 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
     let t = Int64(location.timestamp.timeIntervalSince1970 * 1000)
     let ageMs = -location.timestamp.timeIntervalSinceNow * 1000
     let fix = LocationGate<PendingPoint>.Fix(
-      lat: location.coordinate.latitude, lng: location.coordinate.longitude, acc: acc, t: t
+      lat: location.coordinate.latitude, lng: location.coordinate.longitude, acc: acc, t: t,
+      speedMps: location.speed >= 0 ? location.speed : nil // -1 = invalid
     )
 
     let battery = TrackingManager.readBattery()

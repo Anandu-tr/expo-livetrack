@@ -14,4 +14,15 @@
   <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
   <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
   <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
+  <application>
+    <!--
+      Activity Recognition results (ActivityRegistrations). Declared here rather
+      than by the config plugin: library manifests merge into the host app.
+      Not exported - the PendingIntent is sent with this app's own identity.
+    -->
+    <receiver
+      android:name="expo.modules.livetrack.ActivityReceiver"
+      android:exported="false" />
+  </application>
 </manifest>

@@ -24,11 +24,11 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.google.android.gms.location.ActivityRecognition
 import com.google.android.gms.location.ActivityRecognitionResult
 import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.ActivityTransitionResult
+import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.DetectedActivity
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
@@ -36,10 +36,14 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
+import expo.modules.livetrack.capture.GateStats
 import expo.modules.livetrack.capture.LocationGate
+import expo.modules.livetrack.keepalive.KillStats
+import expo.modules.livetrack.keepalive.Watchdog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -158,8 +162,42 @@ class TrackingService : Service() {
     runCatching { sensorManager?.cancelTriggerSensor(significantMotionListener, sensor) }
   }
 
-  private var activityPendingIntent: PendingIntent? = null
-  private var activitySamplePendingIntent: PendingIntent? = null
+  // --- Activity Recognition health -----------------------------------------
+  // AR has been seen going silent for a day or more on POCO phones (no result
+  // at all, so still mode never engages and the phone polls every 10 s all
+  // night indoors). All times are SystemClock.elapsedRealtime().
+  private var startedAt = 0L
+  private var lastArResultAt = 0L
+  private var lastArReregisterAt = 0L
+  /** Start of the current run of fixes reporting speed < STILL_SPEED_MPS; 0 = none. */
+  private var lowSpeedSince = 0L
+  /** Last fix that reported real motion; vetoes an AR "STILL" right after it. */
+  private var lastMovingFixAt = 0L
+  /** What put us in still mode: AR, or the speed fallback while AR is silent. */
+  private var stillSource = STILL_SOURCE_AR
+
+  // --- Still-mode motion probes --------------------------------------------
+  // In still mode the provider hands back network-grade fixes, which the gate
+  // rejects, so a drive that AR misreads as STILL could go unseen for an hour.
+  // A probe asks for one fresh high-accuracy fix; a moving one exits still mode
+  // through the normal noteAccepted() path.
+  private var probe: CancellationTokenSource? = null
+  private var lastProbeAt = 0L
+  private var nextProbeAt = 0L
+  /** Consecutive probes that found the phone still; stretches the probe interval. */
+  private var probeConfirms = 0
+
+  // --- Periodic maintenance + STATS heartbeat ------------------------------
+  private val stats = GateStats()
+  private var lastStatsAt = 0L
+  private val maintenanceHandler = Handler(Looper.getMainLooper())
+  private val maintenanceTick = object : Runnable {
+    override fun run() {
+      if (!isRunning) return
+      maintenance()
+      maintenanceHandler.postDelayed(this, MAINTENANCE_TICK_MS)
+    }
+  }
 
   // Runtime-registered so PROVIDERS_CHANGED is reliably delivered while we're
   // alive (manifest delivery of this implicit broadcast is often suppressed).
@@ -181,30 +219,41 @@ class TrackingService : Service() {
     super.onCreate()
     fused = LocationServices.getFusedLocationProviderClient(this)
     createNotificationChannel()
+    instance = this
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    // The activity-recognition PendingIntent targets THIS service (not a
-    // BroadcastReceiver, which is a later task), so transition deliveries arrive
-    // here as a re-delivered start intent with ACTION_ACTIVITY_TRANSITION.
-    if (intent?.action == ACTION_ACTIVITY_TRANSITION) {
-      handleActivityTransition(intent)
-      return START_STICKY
-    }
-    if (intent?.action == ACTION_ACTIVITY_SAMPLE) {
-      handleActivitySample(intent)
-      return START_STICKY
+    // AR results now go to ActivityReceiver; these only come from service
+    // PendingIntents registered by an older build (replaced on next register).
+    if (intent?.action == ACTION_ACTIVITY_TRANSITION || intent?.action == ACTION_ACTIVITY_SAMPLE) {
+      if (isRunning) {
+        onActivityIntent(intent)
+        return START_STICKY
+      }
+      // The process died and this AR delivery re-created us bare. Previously that
+      // left a service with no notification and no location for ~20 min.
+      if (!getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).getBoolean(Prefs.KEY_WAS_TRACKING, false)) {
+        ActivityRegistrations.removeAll(applicationContext)
+        stopSelf()
+        return START_NOT_STICKY
+      }
+      return startTracking(null, "ar_restart")
     }
 
-    // Normal start: read config + go foreground. A START_STICKY redelivery after
-    // process death carries a null intent — config then comes from prefs, which
-    // is what `LiveTrackModule.start` persisted (previously the defaults were
-    // used and rows went out with an empty userId).
+    // Normal start. A START_STICKY redelivery after process death carries a null
+    // intent — config then comes from prefs, which is what `LiveTrackModule.start`
+    // persisted (previously the defaults were used and rows went out with an
+    // empty userId).
     val reason = if (intent == null) {
       "sticky_restart"
     } else {
       intent.getStringExtra(EXTRA_START_REASON) ?: "manual"
     }
+    return startTracking(intent, reason)
+  }
+
+  /** Read config, go foreground and (re)arm capture. Shared by every start path. */
+  private fun startTracking(intent: Intent?, reason: String): Int {
     if (intent != null && intent.hasExtra(EXTRA_USER_ID)) readConfig(intent) else readConfigFromPrefs()
 
     // Guard against Android 14 ForegroundServiceStartNotAllowedException /
@@ -213,17 +262,36 @@ class TrackingService : Service() {
     try {
       startForegroundCompat()
     } catch (e: Exception) {
+      // A background recovery can be refused; let the watchdog retry shortly.
+      if (reason == "ar_restart") runCatching { Watchdog.scheduleSoon(applicationContext) }
       stopSelf()
       return START_NOT_STICKY
+    }
+    if (!isRunning) {
+      val now = SystemClock.elapsedRealtime()
+      startedAt = now
+      lastStatsAt = now
+      lastArResultAt = 0L
+      lastArReregisterAt = 0L
+      stats.reset()
     }
     isRunning = true
 
     startLocationUpdates()
     requestActivityUpdates()
     registerProviderReceiver()
+    if (KillStats.isKillRecovery(reason)) recordKillRestart()
     bufferLifecycleEvent("SERVICE_STARTED", reason)
+    maintenanceHandler.removeCallbacks(maintenanceTick)
+    maintenanceHandler.postDelayed(maintenanceTick, MAINTENANCE_TICK_MS)
 
     return START_STICKY
+  }
+
+  private fun recordKillRestart() {
+    val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+    val updated = KillStats.record(prefs.getString(Prefs.KEY_KILL_RESTARTS, null), System.currentTimeMillis())
+    prefs.edit().putString(Prefs.KEY_KILL_RESTARTS, updated).apply()
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) {
@@ -235,11 +303,19 @@ class TrackingService : Service() {
 
   override fun onDestroy() {
     isRunning = false
+    if (instance === this) instance = null
     heartbeatHandler.removeCallbacks(heartbeatTick)
     graceHandler.removeCallbacks(graceTick)
+    maintenanceHandler.removeCallbacks(maintenanceTick)
+    cancelProbe()
     disarmSignificantMotion()
     runCatching { fused.removeLocationUpdates(locationCallback) }
-    removeActivityUpdates()
+    // Keep AR registered if we're supposed to still be tracking: an unexpected
+    // destroy (OEM/system) then gets recovered by the next AR result. After
+    // stop() (wasTracking=false) it is removed so nothing wakes us.
+    if (!getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE).getBoolean(Prefs.KEY_WAS_TRACKING, false)) {
+      removeActivityUpdates()
+    }
     unregisterProviderReceiver()
     // Blocking on purpose: the coroutine scope is cancelled right after, and the
     // held fix + stop marker must land in SQLite before the process goes away.
@@ -404,7 +480,12 @@ class TrackingService : Service() {
     // Monotonic age: a cached fix replayed after a restart looks current by
     // wall-clock but old by elapsedRealtime.
     val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000L
-    val fix = LocationGate.Fix(loc.latitude, loc.longitude, acc, loc.time, loc.elapsedRealtimeNanos / 1_000_000L)
+    val reportedSpeed = if (loc.hasSpeed()) loc.speed.toDouble() else null
+    val fix = LocationGate.Fix(
+      loc.latitude, loc.longitude, acc, loc.time, loc.elapsedRealtimeNanos / 1_000_000L, reportedSpeed,
+    )
+    stats.delivered()
+    noteReportedSpeed(acc, reportedSpeed, ageMs)
 
     val battery = readBattery()
     val mock = isMock(loc)
@@ -436,18 +517,47 @@ class TrackingService : Service() {
     when (val out = g.evaluate(fix, ageMs, point)) {
       is LocationGate.Outcome.Reject -> {
         Log.d(TAG, "gate reject=${out.reason} acc=$acc age=${ageMs}ms t=${loc.time}")
+        stats.reject(out.reason)
+        if (isStill && out.reason in PROBE_HINT_REASONS && isFarFromLastAccepted(loc, acc)) {
+          maybeProbe(hint = true)
+        }
       }
-      is LocationGate.Outcome.Hold -> noteAccepted(loc, out.displacementM)
+      is LocationGate.Outcome.Hold -> {
+        stats.accepted()
+        noteAccepted(loc, out.displacementM)
+      }
       is LocationGate.Outcome.Release -> {
+        stats.accepted()
         noteAccepted(loc, out.displacementM)
         writePoint(out.payload)
       }
       is LocationGate.Outcome.Snap -> {
+        stats.snap()
         // Stationary keepalive at the anchor: proves liveness without painting
         // the jitter blob a parked device otherwise produces.
         writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, speed = 0.0, act = "STILL"))
       }
     }
+  }
+
+  /**
+   * Speed bookkeeping for usable fixes (current, accurate enough): feeds the
+   * AR-silence still fallback and the veto on AR "STILL" while driving. Fixes
+   * that report no speed say nothing either way.
+   */
+  private fun noteReportedSpeed(acc: Double, speed: Double?, ageMs: Long) {
+    if (speed == null || acc < 0.0 || acc > maxAccuracyM || ageMs > LocationGate.MAX_FIX_AGE_MS) return
+    val now = SystemClock.elapsedRealtime()
+    if (speed >= LocationGate.STILL_SPEED_MPS) lowSpeedSince = 0L else if (lowSpeedSince == 0L) lowSpeedSince = now
+    if (speed >= LocationGate.MOTION_SPEED_MPS) lastMovingFixAt = now
+  }
+
+  /** A rejected fix that still says "you've moved": far beyond its own accuracy. */
+  private fun isFarFromLastAccepted(loc: Location, acc: Double): Boolean {
+    val lat = lastLat ?: return false
+    val lng = lastLng ?: return false
+    val d = LocationGate.haversineM(lat, lng, loc.latitude, loc.longitude)
+    return d > acc.coerceAtLeast(0.0) + PROBE_HINT_MARGIN_M
   }
 
   /** Bookkeeping for every fix the gate accepted (held or released). */
@@ -616,31 +726,13 @@ class TrackingService : Service() {
       .setActivityTransition(type)
       .build()
 
+  // (a) Transitions drive responsive still<->moving cadence switching.
+  // (b) Sampling periodically reports the CURRENT most-probable activity. This
+  // seeds the activity at startup (transitions alone never report a current
+  // state) and continuously corrects stale labels (e.g. stuck WALKING).
   private fun requestActivityUpdates() {
     try {
-      val client = ActivityRecognition.getClient(this)
-
-      // (a) Transitions drive responsive still<->moving cadence switching.
-      val transitionPi = PendingIntent.getService(
-        this,
-        REQ_ACTIVITY,
-        Intent(this, TrackingService::class.java).apply { action = ACTION_ACTIVITY_TRANSITION },
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-      )
-      activityPendingIntent = transitionPi
-      client.requestActivityTransitionUpdates(activityTransitionRequest(), transitionPi)
-
-      // (b) Sampling periodically reports the CURRENT most-probable activity. This
-      // seeds the activity at startup (transitions alone never report a current
-      // state) and continuously corrects stale labels (e.g. stuck WALKING).
-      val samplePi = PendingIntent.getService(
-        this,
-        REQ_ACTIVITY_SAMPLE,
-        Intent(this, TrackingService::class.java).apply { action = ACTION_ACTIVITY_SAMPLE },
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-      )
-      activitySamplePendingIntent = samplePi
-      client.requestActivityUpdates(SAMPLE_INTERVAL_MS, samplePi)
+      ActivityRegistrations.request(this, activityTransitionRequest())
     } catch (e: Exception) {
       // AR is an enhancement; capture still works at the moving cadence and the
       // GPS-speed fallback supplies an activity label. Surface the cause (most
@@ -650,26 +742,35 @@ class TrackingService : Service() {
   }
 
   private fun removeActivityUpdates() {
-    val client = ActivityRecognition.getClient(this)
-    activityPendingIntent?.let { pi ->
-      runCatching { client.removeActivityTransitionUpdates(pi) }
-    }
-    activitySamplePendingIntent?.let { pi ->
-      runCatching { client.removeActivityUpdates(pi) }
-    }
-    activityPendingIntent = null
-    activitySamplePendingIntent = null
+    ActivityRegistrations.removeAll(this)
   }
+
+  /** An AR result, from [ActivityReceiver] or a legacy service PendingIntent. Main thread. */
+  fun onActivityIntent(intent: Intent) {
+    when (intent.action) {
+      ACTION_ACTIVITY_TRANSITION -> handleActivityTransition(intent)
+      ACTION_ACTIVITY_SAMPLE -> handleActivitySample(intent)
+    }
+  }
+
+  /**
+   * AR misreads smooth driving as STILL; a fix that just reported real speed
+   * outranks it. The grace period would exit again anyway, but only after
+   * churning the location request and painting a heartbeat mid-drive.
+   */
+  private fun recentlyMoving(): Boolean =
+    lastMovingFixAt != 0L && SystemClock.elapsedRealtime() - lastMovingFixAt < AR_STILL_VETO_MS
 
   private fun handleActivityTransition(intent: Intent) {
     try {
       if (!ActivityTransitionResult.hasResult(intent)) return
       val result = ActivityTransitionResult.extractResult(intent) ?: return
+      lastArResultAt = SystemClock.elapsedRealtime()
       for (event in result.transitionEvents) {
         val entering = event.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
         when (event.activityType) {
           DetectedActivity.STILL -> {
-            if (entering) onEnterStill() else onExitStill()
+            if (!entering) onExitStill() else if (!recentlyMoving()) onEnterStill(STILL_SOURCE_AR)
           }
           else -> {
             if (entering) {
@@ -692,10 +793,12 @@ class TrackingService : Service() {
     try {
       if (!ActivityRecognitionResult.hasResult(intent)) return
       val result = ActivityRecognitionResult.extractResult(intent) ?: return
+      // Any result, even a low-confidence one, proves AR is delivering.
+      lastArResultAt = SystemClock.elapsedRealtime()
       val mostProbable = result.mostProbableActivity
       if (mostProbable.confidence < MIN_CONFIDENCE) return
       when (mostProbable.type) {
-        DetectedActivity.STILL -> onEnterStill()
+        DetectedActivity.STILL -> if (!recentlyMoving()) onEnterStill(STILL_SOURCE_AR)
         DetectedActivity.UNKNOWN, DetectedActivity.TILTING -> {
           // Not actionable: don't overwrite a known label with UNKNOWN/TILTING.
         }
@@ -709,10 +812,18 @@ class TrackingService : Service() {
     }
   }
 
-  private fun onEnterStill() {
-    if (isStill) return
+  /** @param source [STILL_SOURCE_AR], or [STILL_SOURCE_NOAR] from the speed fallback. */
+  private fun onEnterStill(source: String) {
+    if (isStill) {
+      // AR confirming a fallback-entered still state: report it as AR from now on.
+      if (source == STILL_SOURCE_AR) stillSource = STILL_SOURCE_AR
+      return
+    }
     isStill = true
+    stillSource = source
     currentActivity = "STILL"
+    probeConfirms = 0
+    nextProbeAt = SystemClock.elapsedRealtime() + PROBE_FIRST_DELAY_MS
     // Write the fix the gate is holding first: it is the last real position
     // before the stationary period, and nothing else would release it in time.
     flushGate()
@@ -732,6 +843,10 @@ class TrackingService : Service() {
   private fun onExitStill() {
     if (!isStill) return
     isStill = false
+    lowSpeedSince = 0L
+    nextProbeAt = 0L
+    probeConfirms = 0
+    cancelProbe()
     graceHandler.removeCallbacks(graceTick)
     disarmSignificantMotion()
     heartbeatHandler.removeCallbacks(heartbeatTick)
@@ -743,7 +858,8 @@ class TrackingService : Service() {
    *
    * Fired on the still-transition and then every `stillIntervalMs` by
    * [heartbeatTick] for as long as the device stays still, so a long stationary
-   * period is distinguishable from a dead service.
+   * period is distinguishable from a dead service. `r` is [stillSource], so a
+   * still state entered without Activity Recognition shows as `STILL_NOAR`.
    */
   private fun emitHeartbeat() {
     val now = System.currentTimeMillis()
@@ -755,7 +871,7 @@ class TrackingService : Service() {
       t = now,
       lat = lastLat,
       lng = lastLng,
-      act = "STILL",
+      act = stillSource,
       eventType = "HEARTBEAT",
     )
     scope.launch {
@@ -768,6 +884,104 @@ class TrackingService : Service() {
       LiveTrackEventBus.EVENT_EVENT,
       eventBundle("HEARTBEAT", now, lastLat, lastLng, readBattery().first),
     )
+  }
+
+  /**
+   * Once a minute while running (main looper; stretched by deep sleep, which is
+   * fine because every location delivery wakes us too): Activity Recognition
+   * health, the still-mode probe schedule and the STATS heartbeat.
+   */
+  private fun maintenance() {
+    val now = SystemClock.elapsedRealtime()
+    val arSilent = now - maxOf(lastArResultAt, startedAt) > AR_SILENCE_MS
+    if (arSilent && now - lastArReregisterAt > AR_REREGISTER_INTERVAL_MS) {
+      // Re-requesting with the same PendingIntents replaces the registration:
+      // harmless if AR is merely quiet, recovers it if it was dropped.
+      lastArReregisterAt = now
+      requestActivityUpdates()
+    }
+    // Without AR, nothing else would ever enter still mode: a parked phone keeps
+    // polling every movingIntervalMs indoors, which is where the scatter comes from.
+    if (arSilent && !isStill && lowSpeedSince != 0L && now - lowSpeedSince >= STILL_BY_SPEED_MS) {
+      onEnterStill(STILL_SOURCE_NOAR)
+    }
+    if (isStill) maybeProbe(hint = false)
+    if (lifecycleEventsOn && now - lastStatsAt >= STATS_INTERVAL_MS) emitStats(now)
+  }
+
+  /**
+   * Start a probe if one is due. Scheduled probes back off while they keep
+   * finding the phone still; hint probes (a rejected fix far from the last
+   * position) come sooner but with a gap that grows the same way, so a parked
+   * phone's scatter can't keep GNSS busy.
+   */
+  private fun maybeProbe(hint: Boolean) {
+    if (!isStill || !isRunning || probe != null) return
+    val now = SystemClock.elapsedRealtime()
+    val due = if (hint) {
+      now - lastProbeAt >= minOf(PROBE_HINT_MIN_GAP_MS shl probeConfirms.coerceAtMost(8), PROBE_MAX_INTERVAL_MS)
+    } else {
+      nextProbeAt != 0L && now >= nextProbeAt
+    }
+    if (due) startProbe(now)
+  }
+
+  private fun startProbe(now: Long) {
+    val source = CancellationTokenSource()
+    probe = source
+    lastProbeAt = now
+    stats.probe()
+    val request = CurrentLocationRequest.Builder()
+      .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+      .setMaxUpdateAgeMillis(0) // a fresh fix, never the provider's cached one
+      .setDurationMillis(PROBE_DURATION_MS)
+      .build()
+    try {
+      fused.getCurrentLocation(request, source.token).addOnCompleteListener { task ->
+        if (probe !== source) return@addOnCompleteListener // cancelled on exit/destroy
+        probe = null
+        val loc = if (task.isSuccessful) task.result else null
+        // Same gate as every other fix: a moving one exits via noteAccepted().
+        if (loc != null && isRunning) handleLocation(loc)
+        if (isStill) {
+          probeConfirms++
+          nextProbeAt = SystemClock.elapsedRealtime() +
+            minOf(PROBE_FIRST_DELAY_MS shl probeConfirms.coerceAtMost(8), PROBE_MAX_INTERVAL_MS)
+        }
+      }
+    } catch (e: SecurityException) {
+      probe = null
+    }
+  }
+
+  private fun cancelProbe() {
+    probe?.cancel()
+    probe = null
+  }
+
+  /**
+   * HEARTBEAT row whose `r` carries [GateStats] for the last window, in any
+   * mode, so gaps can be classified server-side (nothing delivered vs rejected).
+   */
+  private fun emitStats(now: Long) {
+    lastStatsAt = now
+    val arAgeMin = if (lastArResultAt == 0L) null else (now - lastArResultAt) / 60_000L
+    val row = PointEntity(
+      userId = userId,
+      t = System.currentTimeMillis(),
+      lat = lastLat,
+      lng = lastLng,
+      batt = readBattery().first,
+      act = stats.format(isStill, arAgeMin),
+      eventType = "HEARTBEAT",
+    )
+    stats.reset()
+    scope.launch {
+      runCatching { dao.insert(row) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(stats) failed", mapOf("hasLocation" to "false"))
+      }
+    }
+    runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext) }
   }
 
   // Coarse GPS-speed-derived activity, used only as a fallback when Activity
@@ -798,11 +1012,7 @@ class TrackingService : Service() {
     private const val TAG = "LiveTrack"
     const val CHANNEL_ID = "livetrack"
     const val NOTIF_ID = 4711
-    private const val REQ_ACTIVITY = 1001
-    private const val REQ_ACTIVITY_SAMPLE = 1002
 
-    // How often the Activity Recognition sampler reports the current activity.
-    private const val SAMPLE_INTERVAL_MS = 10_000L
     // Minimum confidence (0-100) before we trust a sampled activity.
     private const val MIN_CONFIDENCE = 50
 
@@ -817,6 +1027,34 @@ class TrackingService : Service() {
     // or that reports at least this speed, ends still mode without waiting for AR.
     private const val STILL_EXIT_DISTANCE_FACTOR = 2.0
     private const val STILL_EXIT_SPEED_MPS = 1.0f
+
+    // Heartbeat `r` values: who decided we're still.
+    private const val STILL_SOURCE_AR = "STILL"
+    private const val STILL_SOURCE_NOAR = "STILL_NOAR"
+
+    // AR samples are requested every 10 s; 15 min without a single result means
+    // it has stopped delivering (seen for 1-2 days at a time on POCO phones).
+    private const val AR_SILENCE_MS = 15 * 60_000L
+    private const val AR_REREGISTER_INTERVAL_MS = 30 * 60_000L
+    // With AR silent, this long of fixes reporting ~0 speed counts as still.
+    private const val STILL_BY_SPEED_MS = 3 * 60_000L
+    // An AR "STILL" this soon after a fix reported real speed is ignored.
+    private const val AR_STILL_VETO_MS = 30_000L
+
+    // Still-mode probes: first one 4 min in, doubling while the phone stays
+    // still, capped at 10 min (the longest a misread drive can go unseen).
+    // Each probe keeps GNSS on for at most 30 s: <= ~5% duty while parked.
+    private const val PROBE_FIRST_DELAY_MS = 4 * 60_000L
+    private const val PROBE_MAX_INTERVAL_MS = 10 * 60_000L
+    private const val PROBE_DURATION_MS = 30_000L
+    // Hint probes: at most every 2 min, stretched like the schedule.
+    private const val PROBE_HINT_MIN_GAP_MS = 2 * 60_000L
+    // A rejected fix this far beyond its own accuracy from the last position.
+    private const val PROBE_HINT_MARGIN_M = 150.0
+    private val PROBE_HINT_REASONS = setOf("accuracy", "teleport", "unconfirmed")
+
+    private const val MAINTENANCE_TICK_MS = 60_000L
+    private const val STATS_INTERVAL_MS = 10 * 60_000L
 
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
     const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"
@@ -834,6 +1072,11 @@ class TrackingService : Service() {
     /** Whether the service is currently running. Read by getState(). */
     @Volatile
     var isRunning: Boolean = false
+      private set
+
+    /** The live instance, for [ActivityReceiver] to hand AR results to. Main thread. */
+    @Volatile
+    var instance: TrackingService? = null
       private set
   }
 }

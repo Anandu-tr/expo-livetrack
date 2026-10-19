@@ -63,4 +63,7 @@ object Prefs {
    */
   const val KEY_ENSURE_NOT_KILLED_LAST_ATTEMPT_AT = "ensureNotKilledLastAttemptAt"
   const val KEY_ENSURE_NOT_KILLED_ATTEMPT_COUNT = "ensureNotKilledAttemptCount"
+
+  /** Recent kill-recovery start times, see [expo.modules.livetrack.keepalive.KillStats]. */
+  const val KEY_KILL_RESTARTS = "killRestarts"
 }

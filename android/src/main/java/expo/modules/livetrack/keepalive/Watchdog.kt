@@ -25,11 +25,21 @@ object Watchdog {
   const val ACTION_WATCHDOG = "expo.modules.livetrack.ACTION_WATCHDOG"
   private const val REQ_WATCHDOG = 2002
   private const val INTERVAL_MS = 15 * 60 * 1000L // ~15 min
+  private const val SOON_MS = 60 * 1000L
 
-  fun schedule(context: Context) {
+  fun schedule(context: Context) = scheduleIn(context, INTERVAL_MS)
+
+  /**
+   * Pull the next check forward to ~1 min (replaces the pending alarm; the
+   * receiver reschedules the normal interval when it fires). Used as a backstop
+   * when a recovery start may have been refused.
+   */
+  fun scheduleSoon(context: Context) = scheduleIn(context, SOON_MS)
+
+  private fun scheduleIn(context: Context, delayMs: Long) {
     val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
     val pi = pendingIntent(context)
-    val triggerAt = SystemClock.elapsedRealtime() + INTERVAL_MS
+    val triggerAt = SystemClock.elapsedRealtime() + delayMs
 
     // Exact-while-idle is best for reliability, but on Android 12+ it needs the
     // SCHEDULE_EXACT_ALARM/USE_EXACT_ALARM permission and may be revoked by the
