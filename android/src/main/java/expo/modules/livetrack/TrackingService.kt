@@ -533,9 +533,10 @@ class TrackingService : Service() {
       }
       is LocationGate.Outcome.Snap -> {
         stats.snap()
-        // Stationary keepalive at the anchor: proves liveness without painting
-        // the jitter blob a parked device otherwise produces.
-        writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, speed = 0.0, act = "STILL"))
+        // Stationary keepalive: at most one real fix per stillIntervalMs instead
+        // of the jitter blob a parked device otherwise paints. Written as the fix
+        // itself (own position and speed), never a repeat of earlier coordinates.
+        writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, act = "STILL"))
       }
     }
   }

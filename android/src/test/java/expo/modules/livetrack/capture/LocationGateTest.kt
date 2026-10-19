@@ -140,15 +140,36 @@ class LocationGateTest {
     assertEquals("p1", (out as Outcome.Release).payload)
   }
 
-  @Test fun subsequentKeepaliveIsASnapAtTheAnchor() {
+  @Test fun subsequentKeepaliveIsWrittenAtTheFixesOwnPosition() {
     val g = gate()
     g.eval(fix(0.0, 0.0), "p1")
     g.eval(fix(3.0, 120.0), "p2") // releases p1, nothing held now
     val out = g.eval(fix(4.0, 240.0), "p3")
     assertTrue(out is Outcome.Snap)
     val snap = out as Outcome.Snap
-    assertEquals(lat0, snap.lat, 1e-9)
+    // Not the anchor's position: repeating its exact coordinates every keepalive
+    // was flagged as a fake location by the backend's fraud check.
+    assertEquals(lat0 + 4.0 / 111_000.0, snap.lat, 1e-9)
     assertEquals(t0 + 240_000L, snap.t)
+  }
+
+  @Test fun keepaliveRepeatingTheLastWrittenCoordinatesExactlyIsSkipped() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0), "p1")
+    g.eval(fix(3.0, 120.0), "p2") // releases p1 at lat0
+    // A provider replay of p1's exact position adds nothing, and exact repeats
+    // are what the backend reads as a spoofed location.
+    assertEquals(Outcome.Reject("jitter"), g.eval(fix(0.0, 240.0), "p3"))
+    // The next genuinely new fix still keeps the phone alive on the map.
+    assertTrue(g.eval(fix(5.0, 250.0), "p4") is Outcome.Snap)
+  }
+
+  @Test fun consecutiveKeepalivesNeverRepeatExactCoordinates() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0), "p1")
+    g.eval(fix(3.0, 120.0), "p2")
+    assertTrue(g.eval(fix(4.0, 240.0), "p3") is Outcome.Snap)
+    assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0, 360.0), "p4"))
   }
 
   @Test fun keepaliveIsRateLimited() {

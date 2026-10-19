@@ -66,7 +66,8 @@ final class LocationGate<T> {
     case hold(displacementM: Double)
     /// The previously held fix is released for writing; the new fix is now held.
     case release(fix: Fix, payload: T, displacementM: Double)
-    /// Stationary keepalive: write a synthetic row at the anchor with this time.
+    /// Stationary keepalive: write the triggering fix at its own position and time
+    /// (never the exact coordinates of the last written row).
     case snap(lat: Double, lng: Double, t: Int64)
   }
 
@@ -89,6 +90,9 @@ final class LocationGate<T> {
   private var cCount = 0
   /// Time of the last fix whose own speed proved motion.
   private var lastMotionT: Int64?
+  /// Coordinates of the last row handed out for writing (release or keepalive).
+  private var lastOutLat: Double?
+  private var lastOutLng: Double?
 
   init(movingDistanceM: Double, maxAccuracyM: Double, keepaliveMs: Double) {
     self.movingDistanceM = movingDistanceM
@@ -122,13 +126,20 @@ final class LocationGate<T> {
     if d < max(movingDistanceM, fix.acc) {
       cCount = 0
       if dt >= keepaliveMs {
-        anchorT = fix.t
         if let h = held {
+          anchorT = fix.t
           held = nil
           emitted = h.fix
-          return .release(fix: h.fix, payload: h.payload, displacementM: d)
+          return release(h, d: d)
         }
-        return .snap(lat: a.lat, lng: a.lng, t: fix.t)
+        // Keepalive at the fix's own position: the anchor's exact coordinates
+        // repeated every keepalive were flagged as a fake location by the backend.
+        // An exact repeat of the last written row adds nothing; skip it.
+        if fix.lat == lastOutLat && fix.lng == lastOutLng { return .reject("jitter") }
+        anchorT = fix.t
+        lastOutLat = fix.lat
+        lastOutLng = fix.lng
+        return .snap(lat: fix.lat, lng: fix.lng, t: fix.t)
       }
       return .reject("jitter")
     }
@@ -173,7 +184,15 @@ final class LocationGate<T> {
     guard let h = held else { return nil }
     held = nil
     emitted = h.fix
+    lastOutLat = h.fix.lat
+    lastOutLng = h.fix.lng
     return (h.fix, h.payload)
+  }
+
+  private func release(_ h: Held, d: Double) -> Outcome {
+    lastOutLat = h.fix.lat
+    lastOutLng = h.fix.lng
+    return .release(fix: h.fix, payload: h.payload, displacementM: d)
   }
 
   private func accept(fix: Fix, payload: T, d: Double) -> Outcome {
@@ -193,7 +212,7 @@ final class LocationGate<T> {
     held = Held(fix: fix, payload: payload)
     if let h = h {
       emitted = h.fix
-      return .release(fix: h.fix, payload: h.payload, displacementM: d)
+      return release(h, d: d)
     }
     return .hold(displacementM: d)
   }

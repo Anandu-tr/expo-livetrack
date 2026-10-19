@@ -306,11 +306,11 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
       noteAccepted(fix)
       writePoint(fix: released, meta: payload, act: "UNKNOWN", userId: cfg.userId)
     case .snap(let lat, let lng, let snapT):
-      // Stationary keepalive at the anchor: proves liveness without painting
-      // the jitter blob a parked device otherwise produces.
+      // Stationary keepalive: at most one real fix per keepalive interval instead
+      // of the jitter blob a parked device otherwise paints. Written as the fix
+      // itself (own position and speed), never a repeat of earlier coordinates.
       let snapFix = LocationGate<PendingPoint>.Fix(lat: lat, lng: lng, acc: acc, t: snapT)
-      let meta = PendingPoint(speed: 0, batt: battery.level, charging: battery.charging, mock: pending.mock)
-      writePoint(fix: snapFix, meta: meta, act: "STILL", userId: cfg.userId)
+      writePoint(fix: snapFix, meta: pending, act: "STILL", userId: cfg.userId)
     }
   }
 

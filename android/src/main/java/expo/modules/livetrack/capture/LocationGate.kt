@@ -73,9 +73,10 @@ class LocationGate<T>(
     data class Release<T>(val fix: Fix, val payload: T, val displacementM: Double) : Outcome<T>()
 
     /**
-     * Stationary keepalive: the caller should write a synthetic row at the anchor
-     * position with time [t] (speed 0). Emitted at most once per [keepaliveMs]
-     * while the device stays within the jitter radius.
+     * Stationary keepalive: the caller should write a row for the triggering fix,
+     * at its own position (within the jitter radius of the anchor) and time [t].
+     * Emitted at most once per [keepaliveMs] while the device stays within the
+     * jitter radius, and never with the exact coordinates of the last written row.
      */
     data class Snap(val lat: Double, val lng: Double, val t: Long) : Outcome<Nothing>()
   }
@@ -100,6 +101,10 @@ class LocationGate<T>(
 
   /** Monotonic time of the last fix whose own speed proved motion; null = none yet. */
   private var lastMotionMonotonicT: Long? = null
+
+  // Coordinates of the last row handed out for writing (release or keepalive).
+  private var lastOutLat: Double? = null
+  private var lastOutLng: Double? = null
 
   /** The fix everything is measured against: the held one if any, else the last released. */
   private val anchor: Fix?
@@ -133,15 +138,24 @@ class LocationGate<T>(
     if (d < max(movingDistanceM, fix.acc)) {
       cCount = 0
       if (dt >= keepaliveMs) {
-        anchorMonotonicT = fix.monotonicT
         val h = held
         if (h != null) {
           // The held real fix doubles as the keepalive.
+          anchorMonotonicT = fix.monotonicT
           held = null
           emitted = h.fix
-          return Outcome.Release(h.fix, h.payload, d)
+          return release(h, d)
         }
-        return Outcome.Snap(a.lat, a.lng, fix.t)
+        // Keepalive at the fix's own position, not the anchor's: the anchor's
+        // exact coordinates repeated every keepaliveMs were flagged as a fake
+        // location by the backend (production, Oct 2026). An exact repeat of the
+        // last written row (a provider cache replay) adds nothing; skip it and
+        // let the next distinct fix keep the phone alive.
+        if (fix.lat == lastOutLat && fix.lng == lastOutLng) return Outcome.Reject("jitter")
+        anchorMonotonicT = fix.monotonicT
+        lastOutLat = fix.lat
+        lastOutLng = fix.lng
+        return Outcome.Snap(fix.lat, fix.lng, fix.t)
       }
       return Outcome.Reject("jitter")
     }
@@ -197,7 +211,15 @@ class LocationGate<T>(
     val h = held ?: return null
     held = null
     emitted = h.fix
+    lastOutLat = h.fix.lat
+    lastOutLng = h.fix.lng
     return h.fix to h.payload
+  }
+
+  private fun release(h: Held<T>, d: Double): Outcome<T> {
+    lastOutLat = h.fix.lat
+    lastOutLng = h.fix.lng
+    return Outcome.Release(h.fix, h.payload, d)
   }
 
   private fun accept(fix: Fix, payload: T, d: Double): Outcome<T> {
@@ -221,7 +243,7 @@ class LocationGate<T>(
     held = Held(fix, payload)
     if (h != null) {
       emitted = h.fix
-      return Outcome.Release(h.fix, h.payload, d)
+      return release(h, d)
     }
     return Outcome.Hold(d)
   }
