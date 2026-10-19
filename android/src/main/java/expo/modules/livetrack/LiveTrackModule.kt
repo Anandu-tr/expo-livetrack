@@ -9,7 +9,6 @@ import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.google.android.gms.common.api.ResolvableApiException
@@ -26,7 +25,6 @@ import expo.modules.livetrack.archive.CoverageCalculator
 import expo.modules.livetrack.archive.ReplayRunner
 import expo.modules.livetrack.buffer.ArchivedPointEntity
 import expo.modules.livetrack.buffer.BufferDb
-import expo.modules.livetrack.buffer.PointEntity
 import expo.modules.livetrack.keepalive.KillStats
 import expo.modules.livetrack.keepalive.Watchdog
 import expo.modules.livetrack.oem.OemAutostart
@@ -140,7 +138,12 @@ class LiveTrackModule : Module() {
       runCatching { UploadWorker.enqueuePeriodic(context) }
 
       // Record a permission-delta event (PERMISSION_GRANTED/REVOKED) vs last seen.
-      scope.launch { runCatching { checkPermissionDelta(context) } }
+      scope.launch {
+        runCatching {
+          val ctx = context
+          DeviceStateEvents.checkPermission(ctx, BufferDb.getInstance(ctx).pointDao(), reason = null)
+        }
+      }
 
       promise.resolve(null)
     }
@@ -162,7 +165,7 @@ class LiveTrackModule : Module() {
           val ctx = context
           // Cheap periodic detection: if battery optimization got re-enabled
           // since last check, buffer a BATTERY_OPT_ON event row.
-          checkBatteryOptDelta(ctx)
+          DeviceStateEvents.checkBatteryOpt(ctx, BufferDb.getInstance(ctx).pointDao(), reason = null)
           val bufferedCount = BufferDb.getInstance(ctx).pointDao().count()
           val state = Bundle().apply {
             putBoolean("tracking", TrackingService.isRunning)
@@ -609,22 +612,9 @@ class LiveTrackModule : Module() {
     }
   }
 
-  private fun permissionState(ctx: Context): String {
-    val fine = ContextCompat.checkSelfPermission(
-      ctx, Manifest.permission.ACCESS_FINE_LOCATION,
-    ) == PackageManager.PERMISSION_GRANTED
-    if (!fine) return "denied"
-    val background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      ContextCompat.checkSelfPermission(
-        ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION,
-      ) == PackageManager.PERMISSION_GRANTED
-    } else {
-      true // pre-Q: foreground grant covers background.
-    }
-    // Per TrackerState type: "granted" = full (incl. background); "background"
-    // here means "foreground-only / needs background upgrade".
-    return if (background) "granted" else "background"
-  }
+  // Per TrackerState type: "granted" = full (incl. background); "background"
+  // here means "foreground-only / needs background upgrade".
+  private fun permissionState(ctx: Context): String = DeviceStateEvents.locationPermission(ctx)
 
   /** Silent-kill recoveries of the tracking service in the last 24 h (see [KillStats]). */
   private fun killRestarts24h(ctx: Context): Int =
@@ -642,62 +632,7 @@ class LiveTrackModule : Module() {
     }
   }
 
-  private fun isBatteryOptIgnored(ctx: Context): Boolean {
-    val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
-    return try {
-      pm.isIgnoringBatteryOptimizations(ctx.packageName)
-    } catch (e: Exception) {
-      false
-    }
-  }
-
-  /**
-   * Compare current location-permission grant to the last-seen value and buffer
-   * a PERMISSION_GRANTED / PERMISSION_REVOKED event row on a change. Runs on IO.
-   */
-  private fun checkPermissionDelta(ctx: Context) {
-    val granted = permissionState(ctx) == "granted"
-    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    val hadValue = prefs.contains(Prefs.KEY_LAST_PERMISSION_GRANTED)
-    val last = prefs.getBoolean(Prefs.KEY_LAST_PERMISSION_GRANTED, granted)
-    prefs.edit().putBoolean(Prefs.KEY_LAST_PERMISSION_GRANTED, granted).apply()
-    if (hadValue && last != granted) {
-      bufferEvent(ctx, if (granted) "PERMISSION_GRANTED" else "PERMISSION_REVOKED")
-    }
-  }
-
-  /**
-   * If battery optimization got re-enabled since the last check, buffer a
-   * BATTERY_OPT_ON event row (kept simple; driven from getState()).
-   */
-  private fun checkBatteryOptDelta(ctx: Context) {
-    val ignored = isBatteryOptIgnored(ctx)
-    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    val hadValue = prefs.contains(Prefs.KEY_LAST_BATTERY_OPT_IGNORED)
-    val last = prefs.getBoolean(Prefs.KEY_LAST_BATTERY_OPT_IGNORED, ignored)
-    prefs.edit().putBoolean(Prefs.KEY_LAST_BATTERY_OPT_IGNORED, ignored).apply()
-    // Transition from exempt -> optimized again is the noteworthy event.
-    if (hadValue && last && !ignored) {
-      bufferEvent(ctx, "BATTERY_OPT_ON")
-    }
-  }
-
-  /** Insert a tier-2 event row + emit onEvent (best-effort). Caller is on IO. */
-  private fun bufferEvent(ctx: Context, eventType: String) {
-    val userId = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-      .getString(Prefs.KEY_USER_ID, "") ?: ""
-    val now = System.currentTimeMillis()
-    runCatching {
-      BufferDb.getInstance(ctx).pointDao().insert(
-        PointEntity(userId = userId, t = now, eventType = eventType),
-      )
-    }
-    val payload = Bundle().apply {
-      putString("e", eventType)
-      putDouble("t", now.toDouble())
-    }
-    runCatching { LiveTrackEventBus.emit(LiveTrackEventBus.EVENT_EVENT, payload) }
-  }
+  private fun isBatteryOptIgnored(ctx: Context): Boolean = DeviceStateEvents.isBatteryOptIgnored(ctx)
 
   /** Wire shape matching `LocationRecord` in LiveTrack.types.ts (l/g/t/s/acc/b/c/act/mock). */
   private fun archivedPointRecord(p: ArchivedPointEntity): Map<String, Any?> = mapOf(

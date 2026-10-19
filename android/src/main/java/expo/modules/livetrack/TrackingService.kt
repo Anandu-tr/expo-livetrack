@@ -254,6 +254,10 @@ class TrackingService : Service() {
 
   /** Read config, go foreground and (re)arm capture. Shared by every start path. */
   private fun startTracking(intent: Intent?, reason: String): Int {
+    // First, before going foreground can fail: record location on/off, permission
+    // and battery-optimisation changes made while nothing was listening (e.g. a
+    // revoked permission is exactly what makes the foreground start fail).
+    DeviceStateEvents.reconcileAsync(applicationContext)
     if (intent != null && intent.hasExtra(EXTRA_USER_ID)) readConfig(intent) else readConfigFromPrefs()
 
     // Guard against Android 14 ForegroundServiceStartNotAllowedException /
@@ -889,10 +893,13 @@ class TrackingService : Service() {
 
   /**
    * Once a minute while running (main looper; stretched by deep sleep, which is
-   * fine because every location delivery wakes us too): Activity Recognition
-   * health, the still-mode probe schedule and the STATS heartbeat.
+   * fine because every location delivery wakes us too): device-state reconcile,
+   * Activity Recognition health, the still-mode probe schedule and the STATS
+   * heartbeat.
    */
   private fun maintenance() {
+    // Cheap reads; writes and records only when something changed.
+    DeviceStateEvents.reconcileAsync(applicationContext)
     val now = SystemClock.elapsedRealtime()
     val arSilent = now - maxOf(lastArResultAt, startedAt) > AR_SILENCE_MS
     if (arSilent && now - lastArReregisterAt > AR_REREGISTER_INTERVAL_MS) {

@@ -158,6 +158,9 @@ export interface TrackerEvent {
    * Reason. SERVICE_STARTED / SERVICE_STOPPED: why. HEARTBEAT (stored rows):
    * `STILL`, `STILL_NOAR` (still detected from speed because Activity
    * Recognition was silent) or a `STATS|...` diagnostics summary.
+   * LOCATION_ON/OFF, PERMISSION_* and BATTERY_OPT_ON: `reconcile` when the
+   * change was found later (service start / periodic check) rather than as it
+   * happened; `t` is then when it was noticed.
    */
   r?: string;
 }
