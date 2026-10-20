@@ -13,6 +13,7 @@ class GateStats {
   private var nAccepted = 0
   private var nSnaps = 0
   private var nProbes = 0
+  private var fastMs = 0L
   /** One slot per known reason, plus a last slot for anything unrecognised. */
   private val rejects = IntArray(REASONS.size + 1)
 
@@ -20,6 +21,9 @@ class GateStats {
   fun accepted() { nAccepted++ }
   fun snap() { nSnaps++ }
   fun probe() { nProbes++ }
+
+  /** Time spent with fast (vehicle-speed) fix requests. */
+  fun fast(ms: Long) { if (ms > 0) fastMs += ms }
 
   fun reject(reason: String) {
     val i = REASONS.indexOfFirst { it.first == reason }
@@ -31,14 +35,16 @@ class GateStats {
     nAccepted = 0
     nSnaps = 0
     nProbes = 0
+    fastMs = 0L
     rejects.fill(0)
   }
 
   /**
    * Compact `r` value for a HEARTBEAT row, e.g.
-   * `STATS|m=S|ar=12|d=60|a=10|sn=2|acc=5|st=0|oo=0|tp=1|ji=40|zz=0|un=3|pr=1`.
+   * `STATS|m=S|ar=12|d=60|a=10|sn=2|acc=5|st=0|oo=0|tp=1|ji=40|zz=0|un=3|pr=1|fc=0`.
    * `m` = still (S) / moving (M); `ar` = minutes since the last Activity
-   * Recognition result, -1 if none yet this run.
+   * Recognition result, -1 if none yet this run; `fc` = seconds of fast fix
+   * requests (read against the rows' battery level).
    */
   fun format(still: Boolean, arSilentMin: Long?): String = buildString {
     append("STATS|m=").append(if (still) 'S' else 'M')
@@ -48,6 +54,7 @@ class GateStats {
     append("|sn=").append(nSnaps)
     REASONS.forEachIndexed { i, (_, key) -> append('|').append(key).append('=').append(rejects[i]) }
     append("|pr=").append(nProbes)
+    append("|fc=").append(fastMs / 1000)
     if (rejects[REASONS.size] > 0) append("|x=").append(rejects[REASONS.size])
   }
 

@@ -140,57 +140,76 @@ class LocationGateTest {
     assertEquals("p1", (out as Outcome.Release).payload)
   }
 
-  @Test fun subsequentKeepaliveIsWrittenAtTheFixesOwnPosition() {
+  // --- parked points: one per 10 min, the real fix nearest the last one ---------
+  // Production (Oct 2026): a keepalive every 2 min at each fix's own position
+  // drew a 50-line scribble over a two-hour office stay at high zoom; keeping
+  // only sharp fixes then left an indoor stay without a point for 71 min.
+
+  @Test fun parkedPointIsWrittenTenMinutesAfterTheStop() {
     val g = gate()
     g.eval(fix(0.0, 0.0), "p1")
-    g.eval(fix(3.0, 120.0), "p2") // releases p1, nothing held now
-    val out = g.eval(fix(4.0, 240.0), "p3")
+    g.eval(fix(3.0, 120.0), "p2") // releases p1 (the stop), nothing held now
+    for (i in 2..4) assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0, 120.0 * i), "q$i"))
+    val out = g.eval(fix(4.0, 600.0), "p3")
+    assertTrue(out is Outcome.Snap)
+    // Stamped now: the newest point says the phone is still here.
+    assertEquals(t0 + 600_000L, (out as Outcome.Snap).t)
+  }
+
+  @Test fun parkedPointIsTheRealFixNearestTheLastOne() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
+    g.eval(fix(12.0, 120.0, acc = 20.0, speed = 0.0), "p2") // releases p1 at lat0
+    g.eval(fix(-2.0, 240.0, acc = 25.0, speed = 0.0, dLngM = 1.0), "near")
+    g.eval(fix(15.0, 360.0, acc = 20.0, speed = 0.0, dLngM = -8.0), "p4")
+    val out = g.eval(fix(18.0, 600.0, acc = 20.0, speed = 0.0), "p5")
     assertTrue(out is Outcome.Snap)
     val snap = out as Outcome.Snap
-    // Not the anchor's position: repeating its exact coordinates every keepalive
-    // was flagged as a fake location by the backend's fraud check.
-    assertEquals(lat0 + 4.0 / 111_000.0, snap.lat, 1e-9)
-    assertEquals(t0 + 240_000L, snap.t)
+    // A real fix (natural jitter, never synthesised) with its own accuracy, but
+    // the one that stayed nearest p1, so the drawn line barely moves.
+    val near = fix(-2.0, 240.0, dLngM = 1.0)
+    assertEquals(near.lat, snap.lat, 1e-12)
+    assertEquals(near.lng, snap.lng, 1e-12)
+    assertEquals(25.0, snap.acc, 1e-9)
   }
 
-  @Test fun keepaliveRepeatingTheLastWrittenCoordinatesExactlyIsSkipped() {
+  @Test fun blurryIndoorStayStillGetsAPointEveryTenMinutes() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 25.0, speed = 0.0), "p1")
+    val outs = (1..30).map { i -> g.eval(fix((i % 5) - 2.0, 120.0 * i, acc = 25.0, speed = 0.0), "j$i") }
+    val snaps = outs.filterIsInstance<Outcome.Snap>()
+    // An hour at 25 m accuracy: a point every 10 min after the stop's own row.
+    assertEquals((1..6).map { t0 + 600_000L * it }, snaps.map { it.t })
+    assertTrue(snaps.all { it.acc == 25.0 })
+    snaps.zipWithNext().forEach { (a, b) -> assertTrue(a.lat != b.lat || a.lng != b.lng) }
+  }
+
+  @Test fun parkedPointsNeverRepeatTheLastCoordinatesExactly() {
     val g = gate()
     g.eval(fix(0.0, 0.0), "p1")
-    g.eval(fix(3.0, 120.0), "p2") // releases p1 at lat0
-    // A provider replay of p1's exact position adds nothing, and exact repeats
+    // A provider replaying p1's exact position adds nothing, and exact repeats
     // are what the backend reads as a spoofed location.
-    assertEquals(Outcome.Reject("jitter"), g.eval(fix(0.0, 240.0), "p3"))
-    // The next genuinely new fix a keepalive interval later still keeps alive.
-    assertTrue(g.eval(fix(5.0, 360.0), "p4") is Outcome.Snap)
+    for (i in 1..5) g.eval(fix(0.0, 120.0 * i), "same$i") // the first releases p1
+    assertEquals(Outcome.Reject("jitter"), g.eval(fix(0.0, 720.0), "same6"))
+    // The next genuinely new fix keeps it alive.
+    val out = g.eval(fix(5.0, 840.0), "p2")
+    assertTrue(out is Outcome.Snap)
+    assertEquals(lat0 + 5.0 / 111_000.0, (out as Outcome.Snap).lat, 1e-9)
   }
 
-  // --- parked keepalives: sparse and sharp ------------------------------------
-  // Production (Oct 2026): a keepalive every 2 min at each fix's own position
-  // drew a 50-line scribble over a two-hour office stay at high zoom.
-
-  @Test fun keepalivesAreAtLeastTenMinutesApart() {
+  @Test fun parkedPointsAreAtLeastTenMinutesApart() {
     val g = gate()
     g.eval(fix(0.0, 0.0), "p1")
     g.eval(fix(3.0, 120.0), "p2") // releases p1
-    assertTrue(g.eval(fix(4.0, 240.0), "p3") is Outcome.Snap)
-    for (i in 1..4) {
-      assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0 + i, 240.0 + 120.0 * i), "q$i"))
-    }
-    assertTrue(g.eval(fix(2.0, 240.0 + 600.0), "p4") is Outcome.Snap)
+    val outs = (2..15).map { i -> g.eval(fix(1.0 + (i % 3), 120.0 * i), "q$i") }
+    val snapTimes = outs.filterIsInstance<Outcome.Snap>().map { it.t }
+    assertEquals(listOf(t0 + 600_000L, t0 + 1_200_000L, t0 + 1_800_000L), snapTimes)
   }
 
-  @Test fun blurryFixNeverBecomesAKeepalive() {
-    val g = gate()
-    g.eval(fix(0.0, 0.0), "p1")
-    g.eval(fix(3.0, 120.0), "p2")
-    // 25 m accuracy indoors: within the jitter radius, but not sharp enough to draw.
-    assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0, 240.0, acc = 25.0), "p3"))
-  }
-
-  @Test fun parkedPhoneKeepsTheSpeedCheckStrictWithoutKeepalives() {
+  @Test fun parkedPhoneKeepsTheSpeedCheckStrict() {
     val g = gate()
     g.eval(fix(0.0, 0.0, acc = 25.0, speed = 0.0), "p1")
-    // An hour parked with only blurry fixes: nothing is written...
+    // An hour parked: only a point per 10 min is written...
     for (i in 1..30) g.eval(fix(2.0, 120.0 * i, acc = 25.0, speed = 0.0), "j$i")
     // ...but the time base kept up, so 3 km in 30 s is still a teleport.
     assertEquals(Outcome.Reject("teleport"), g.eval(fix(3_000.0, 3_630.0, speed = 5.0), "far"))

@@ -26,10 +26,8 @@ enum LocationGateLimits {
   /// A stationary-claiming fix further than max(this, factor x acc) needs confirmation.
   static let unconfirmedMinJumpM = 75.0
   static let unconfirmedAccFactor = 3.0
-  /// Parked keepalive rows: at most one per this interval...
+  /// Parked points: one per this interval after the last written row.
   static let snapIntervalMs: Int64 = 600_000
-  /// ...and only from a fix at least this accurate (indoor fixes wander 20-35 m).
-  static let snapMaxAccM = 15.0
 
   private static let earthRadiusM = 6_371_000.0
 
@@ -70,9 +68,10 @@ final class LocationGate<T> {
     case hold(displacementM: Double)
     /// The previously held fix is released for writing; the new fix is now held.
     case release(fix: Fix, payload: T, displacementM: Double)
-    /// Stationary keepalive: write the triggering fix at its own position and time
-    /// (never the exact coordinates of the last written row).
-    case snap(lat: Double, lng: Double, t: Int64)
+    /// Parked point: write a row at lat/lng with accuracy `acc`, stamped with the
+    /// current fix's time `t`. The position is the real fix seen since the last
+    /// written row that stayed nearest it, never that row's exact coordinates.
+    case snap(lat: Double, lng: Double, t: Int64, acc: Double)
   }
 
   private struct Held {
@@ -94,11 +93,13 @@ final class LocationGate<T> {
   private var cCount = 0
   /// Time of the last fix whose own speed proved motion.
   private var lastMotionT: Int64?
-  /// Coordinates of the last row handed out for writing (release or keepalive).
+  /// The last row handed out for writing (release, keepalive or flush).
   private var lastOutLat: Double?
   private var lastOutLng: Double?
-  /// Time of the last keepalive handed out.
-  private var lastSnapT: Int64?
+  private var lastOutT: Int64?
+  /// Parked: the fix nearest the last written row since it was written, and its distance.
+  private var parkedBest: Fix?
+  private var parkedBestM = Double.greatestFiniteMagnitude
 
   init(movingDistanceM: Double, maxAccuracyM: Double, keepaliveMs: Double) {
     self.movingDistanceM = movingDistanceM
@@ -136,16 +137,17 @@ final class LocationGate<T> {
         // nothing is written, so the speed check stays strict while parked.
         anchorT = fix.t
         if let h = held {
+          // The held real fix is the last position before the stop.
           held = nil
           emitted = h.fix
-          return release(h, d: d)
+          let out = release(h, d: d)
+          noteParked(fix)
+          return out
         }
-        if isKeepaliveDue(fix) {
-          lastSnapT = fix.t
-          lastOutLat = fix.lat
-          lastOutLng = fix.lng
-          return .snap(lat: fix.lat, lng: fix.lng, t: fix.t)
-        }
+      }
+      if held == nil {
+        noteParked(fix)
+        if isKeepaliveDue(fix) { return keepalive(now: fix) }
       }
       return .reject("jitter")
     }
@@ -178,11 +180,34 @@ final class LocationGate<T> {
     return reportsNoMotion && !recentMotion
   }
 
-  /// Parked keepalive rows: sparse, sharp, never an exact repeat (see the Android gate).
+  /// Parked points: one per snapIntervalMs, each the real fix that stayed nearest
+  /// the previous point, never an exact repeat (see the Android gate).
+  private func noteParked(_ fix: Fix) {
+    guard let lat = lastOutLat, let lng = lastOutLng else { return }
+    if fix.lat == lat && fix.lng == lng { return }
+    let m = LocationGateLimits.haversineM(lat, lng, fix.lat, fix.lng)
+    if m < parkedBestM {
+      parkedBest = fix
+      parkedBestM = m
+    }
+  }
+
   private func isKeepaliveDue(_ fix: Fix) -> Bool {
-    fix.acc <= LocationGateLimits.snapMaxAccM &&
-      (lastSnapT.map { fix.t - $0 >= LocationGateLimits.snapIntervalMs } ?? true) &&
-      !(fix.lat == lastOutLat && fix.lng == lastOutLng)
+    parkedBest != nil && (lastOutT.map { fix.t - $0 >= LocationGateLimits.snapIntervalMs } ?? true)
+  }
+
+  private func keepalive(now: Fix) -> Outcome {
+    guard let b = parkedBest else { return .reject("jitter") }
+    markOut(lat: b.lat, lng: b.lng, t: now.t)
+    return .snap(lat: b.lat, lng: b.lng, t: now.t, acc: b.acc)
+  }
+
+  private func markOut(lat: Double, lng: Double, t: Int64) {
+    lastOutLat = lat
+    lastOutLng = lng
+    lastOutT = t
+    parkedBest = nil
+    parkedBestM = Double.greatestFiniteMagnitude
   }
 
   /// Count `fix` towards the re-anchor candidate; true once enough agree.
@@ -208,14 +233,12 @@ final class LocationGate<T> {
     guard let h = held else { return nil }
     held = nil
     emitted = h.fix
-    lastOutLat = h.fix.lat
-    lastOutLng = h.fix.lng
+    markOut(lat: h.fix.lat, lng: h.fix.lng, t: h.fix.t)
     return (h.fix, h.payload)
   }
 
   private func release(_ h: Held, d: Double) -> Outcome {
-    lastOutLat = h.fix.lat
-    lastOutLng = h.fix.lng
+    markOut(lat: h.fix.lat, lng: h.fix.lng, t: h.fix.t)
     return .release(fix: h.fix, payload: h.payload, displacementM: d)
   }
 

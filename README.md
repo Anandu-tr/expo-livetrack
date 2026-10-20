@@ -134,10 +134,11 @@ interface Cadence {
 }
 ```
 
-How the cadence is applied on Android:
+How the cadence is applied:
 
-- **Moving:** fixes are requested every 3 s (or `movingIntervalMs` if shorter). A point is written about every `movingIntervalMs`, plus wherever the heading turns by 30° or more over a 15 m+ leg, so corners are drawn instead of cut.
-- **Parked:** a fix that reports ~0 speed and moved less than its own plus the previous fix's accuracy is drift, not a move. Keepalive points are written at most every 10 min and only from fixes accurate to 15 m, so a parked phone shows as a dot. Liveness comes from the still-mode `HEARTBEAT` every `stillIntervalMs`.
+- **Moving (Android):** fixes are requested every `movingIntervalMs`, and every 3 s while a fix in the last 2 min reported vehicle speed (≥ 3 m/s); walking pace and stops stay on the slower cadence to save battery. A point is written about every `movingIntervalMs`, plus wherever the heading turns by 30° or more over a 15 m+ leg, so corners are drawn instead of cut. The `STATS` heartbeat's `fc` field reports the seconds spent on the 3 s cadence.
+- **Moving (iOS):** updates arrive every `movingDistanceM` of movement and every one that passes the gate is written, so corners are already drawn at that resolution.
+- **Parked (both):** a fix that reports ~0 speed and moved less than its own plus the previous fix's accuracy is drift, not a move. One point is written every 10 min: the real fix since the last point that stayed nearest it (with its own accuracy), stamped with the current time. The newest point is never more than ~10 min old, and the line barely moves even indoors. A point never repeats the previous coordinates exactly, because the backend flags zero jitter as spoofing.
 
 ### `TrackerState`
 
@@ -167,7 +168,7 @@ Each event is `{ e: EventType, t: number, l?, g?, b? }`. `EventType` is one of:
 | *(stops)* | With `diagnostics.lifecycleEvents`, `SERVICE_STOPPED` also records **phone switched off** (`r: "shutdown"`, written at power-off and uploaded after the next boot) and, on Android 11+, how the previous process ended, at its real time, read on the next start: **force-stop** (`r: "force_stop"`) or an OS/OEM kill (`r: "killed_low_memory"`, `"killed_other:<description>"`, …). |
 | *(internet)* | With `diagnostics.lifecycleEvents`, a `HEARTBEAT` with `r: "NET_OFF"` when the phone has had no working internet for 2 min (its `t` is when the outage began) and `r: "NET_ON"` when it is back. Both upload once online. |
 | *(reconciled)* | `LOCATION_ON/OFF`, `PERMISSION_GRANTED/REVOKED` and `BATTERY_OPT_ON` are also checked on every service start and once a minute while tracking, so a change made while the service was dead or the app was closed is still recorded. Such a row carries `r: "reconcile"` and its `t` is when it was noticed, not when it happened. |
-| `HEARTBEAT` | Periodic liveness signal from the service. Stored rows carry `r`: `STILL` (still per Activity Recognition), `STILL_NOAR` (still inferred from speed because Activity Recognition was silent for 15 min), or `STATS\|m=..\|ar=..\|d=..\|...` every 10 min when `diagnostics.lifecycleEvents` is on (fix deliveries, gate rejects by reason, probes, minutes since the last Activity Recognition result). |
+| `HEARTBEAT` | Periodic liveness signal from the service. Stored rows carry `r`: `STILL` (still per Activity Recognition), `STILL_NOAR` (still inferred from speed because Activity Recognition was silent for 15 min), or `STATS\|m=..\|ar=..\|d=..\|...` every 10 min when `diagnostics.lifecycleEvents` is on (fix deliveries, gate rejects by reason, probes, minutes since the last Activity Recognition result, seconds on the 3 s moving cadence). |
 
 ### `LocationRecord` (`onLocation`) and `SyncError` (`onSyncError`)
 
@@ -300,6 +301,13 @@ the enable-location popup) lives in [`example/App.tsx`](./example/App.tsx).
 2. In `example/App.tsx`, set `TRACK_URL` to `http://<YOUR-LAN-IP>:8787/locations/batch`
    — a device cannot reach `localhost`.
 3. Build and run the example as a dev build (not Expo Go).
+
+### Native unit tests
+
+- Android (JUnit): `./gradlew :expo-livetrack:testDebugUnitTest` from the host app's `android/` directory.
+- iOS noise gate (`ios/LocationGate.swift` needs only Foundation), no Mac required:
+  `docker run --rm -v "$PWD:/src:ro" swift:5.10-jammy bash -c 'cd /tmp && swiftc /src/ios/LocationGate.swift /src/ios-spec/main.swift -o spec && ./spec'`
+  (on a Mac: `swiftc ios/LocationGate.swift ios-spec/main.swift -o /tmp/spec && /tmp/spec`). The spec mirrors the Android `LocationGateTest` cases that apply to iOS.
 
 ## Compliance docs
 

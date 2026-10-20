@@ -46,6 +46,7 @@ import com.google.android.gms.tasks.CancellationTokenSource
 import expo.modules.livetrack.buffer.BufferDb
 import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
+import expo.modules.livetrack.capture.FastCadence
 import expo.modules.livetrack.capture.GateStats
 import expo.modules.livetrack.capture.LocationGate
 import expo.modules.livetrack.capture.TurnSampler
@@ -102,6 +103,10 @@ class TrackingService : Service() {
 
   // Picks which accepted moving fixes become points (interval + turns).
   private var sampler = TurnSampler(movingIntervalMs)
+
+  // Fast fix requests (FAST_FIX_INTERVAL_MS) only while recently at vehicle
+  // speed; walking pace and stops keep movingIntervalMs. Fed elapsedRealtime().
+  private val fast = FastCadence()
 
   // Motion state.
   @Volatile private var isStill: Boolean = false
@@ -590,9 +595,14 @@ class TrackingService : Service() {
   }
 
   private fun startLocationUpdates() {
-    // Moving: fixes every few seconds so turns can be caught; TurnSampler still
-    // writes a point only about every movingIntervalMs plus at the turns.
-    val intervalMs = if (isStill) stillIntervalMs else minOf(movingIntervalMs, MOVING_FIX_INTERVAL_MS)
+    // At vehicle speed: fixes every few seconds so turns can be caught;
+    // TurnSampler still writes a point only about every movingIntervalMs plus
+    // at the turns.
+    val intervalMs = when {
+      isStill -> stillIntervalMs
+      fast.on -> minOf(movingIntervalMs, FAST_FIX_INTERVAL_MS)
+      else -> movingIntervalMs
+    }
     val request = buildLocationRequest(intervalMs, isStill)
     try {
       // Permission is the caller's responsibility (requested via the module);
@@ -676,10 +686,10 @@ class TrackingService : Service() {
       }
       is LocationGate.Outcome.Snap -> {
         stats.snap()
-        // Stationary keepalive: at most one real fix per stillIntervalMs instead
-        // of the jitter blob a parked device otherwise paints. Written as the fix
-        // itself (own position and speed), never a repeat of earlier coordinates.
-        writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, act = "STILL"))
+        // Parked: one point per 10 min at the real recent fix the gate picked
+        // (with that fix's accuracy), stamped now so the newest point says the
+        // phone is still here. Never a repeat of earlier coordinates.
+        writePoint(point.copy(t = out.t, lat = out.lat, lng = out.lng, acc = out.acc, act = "STILL"))
       }
     }
   }
@@ -694,6 +704,7 @@ class TrackingService : Service() {
     val now = SystemClock.elapsedRealtime()
     if (speed >= LocationGate.STILL_SPEED_MPS) lowSpeedSince = 0L else if (lowSpeedSince == 0L) lowSpeedSince = now
     if (speed >= LocationGate.MOTION_SPEED_MPS) lastMovingFixAt = now
+    if (fast.onSpeed(speed, now, isStill) && isRunning) restartLocationUpdates()
   }
 
   /** A rejected fix that still says "you've moved": far beyond its own accuracy. */
@@ -967,6 +978,8 @@ class TrackingService : Service() {
     isStill = true
     stillSource = source
     currentActivity = "STILL"
+    // Bookkeeping only: the grace period keeps the current request running.
+    fast.update(SystemClock.elapsedRealtime(), still = true)
     probeConfirms = 0
     nextProbeAt = SystemClock.elapsedRealtime() + PROBE_FIRST_DELAY_MS
     // Write the fix the gate is holding first: it is the last real position
@@ -995,7 +1008,9 @@ class TrackingService : Service() {
     graceHandler.removeCallbacks(graceTick)
     disarmSignificantMotion()
     heartbeatHandler.removeCallbacks(heartbeatTick)
-    restartLocationUpdates() // restore movingIntervalMs
+    // A fast fix may be what ended still mode: go straight to the fast cadence.
+    fast.update(SystemClock.elapsedRealtime(), still = false)
+    restartLocationUpdates() // restore the moving cadence
   }
 
   /**
@@ -1057,6 +1072,9 @@ class TrackingService : Service() {
       onEnterStill(STILL_SOURCE_NOAR)
     }
     if (isStill) maybeProbe(hint = false)
+    // Back to movingIntervalMs once no fix has been fast for a while (with the
+    // distance floor, a stopped phone gets no deliveries to notice it from).
+    if (fast.update(now, isStill) && isRunning && !isStill) restartLocationUpdates()
     if (lifecycleEventsOn && now - lastStatsAt >= STATS_INTERVAL_MS) emitStats(now)
   }
 
@@ -1116,6 +1134,7 @@ class TrackingService : Service() {
    */
   private fun emitStats(now: Long) {
     lastStatsAt = now
+    stats.fast(fast.takeSpentMs(now))
     val arAgeMin = if (lastArResultAt == 0L) null else (now - lastArResultAt) / 60_000L
     val row = PointEntity(
       userId = userId,
@@ -1210,9 +1229,11 @@ class TrackingService : Service() {
     // its start; Wi-Fi / mobile handovers drop connectivity for seconds.
     private const val NET_OFF_CONFIRM_MS = 2 * 60_000L
 
-    // Fix cadence while moving. At 10 s (a quarter of slots skipped by the
-    // provider) city turns fell between points and were drawn as diagonals.
-    private const val MOVING_FIX_INTERVAL_MS = 3_000L
+    // Fix cadence while moving at vehicle speed (see FastCadence). At 10 s (a
+    // quarter of slots skipped by the provider) city turns fell between points
+    // and were drawn as diagonals. The STATS `fc` field says how long it ran,
+    // to check against battery drain.
+    private const val FAST_FIX_INTERVAL_MS = 3_000L
 
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
     const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"

@@ -83,12 +83,12 @@ class LocationGate<T>(
     ) : Outcome<T>()
 
     /**
-     * Parked keepalive: the caller should write a row for the triggering fix, at
-     * its own position (within the jitter radius of the anchor) and time [t].
-     * At most one per [snapIntervalMs], only from a fix at least [SNAP_MAX_ACC_M]
-     * accurate, and never with the exact coordinates of the last written row.
+     * Parked point: the caller writes a row at [lat]/[lng] with accuracy [acc],
+     * stamped with the current fix's time [t]. The position is a real fix seen
+     * since the last written row (the one nearest that row), never that row's
+     * exact coordinates. Due [snapIntervalMs] after the last written row.
      */
-    data class Snap(val lat: Double, val lng: Double, val t: Long) : Outcome<Nothing>()
+    data class Snap(val lat: Double, val lng: Double, val t: Long, val acc: Double) : Outcome<Nothing>()
   }
 
   private class Held<T>(val fix: Fix, val payload: T)
@@ -112,12 +112,16 @@ class LocationGate<T>(
   /** Monotonic time of the last fix whose own speed proved motion; null = none yet. */
   private var lastMotionMonotonicT: Long? = null
 
-  // Coordinates of the last row handed out for writing (release or keepalive).
+  // The last row handed out for writing (release, keepalive or flush).
   private var lastOutLat: Double? = null
   private var lastOutLng: Double? = null
 
-  /** Monotonic time of the last keepalive handed out; null = none yet. */
-  private var lastSnapMonotonicT: Long? = null
+  /** Monotonic time of that row; null = none yet. */
+  private var lastOutMonotonicT: Long? = null
+
+  /** Parked: the fix nearest the last written row since it was written, and its distance. */
+  private var parkedBest: Fix? = null
+  private var parkedBestM = Double.MAX_VALUE
 
   /** The fix everything is measured against: the held one if any, else the last released. */
   private val anchor: Fix?
@@ -156,17 +160,17 @@ class LocationGate<T>(
         anchorMonotonicT = fix.monotonicT
         val h = held
         if (h != null) {
-          // The held real fix doubles as the keepalive: the last position before the stop.
+          // The held real fix is the last position before the stop: always drawn.
           held = null
           emitted = h.fix
-          return release(h, d, atStop = true)
+          val out = release(h, d, atStop = true)
+          noteParked(fix)
+          return out
         }
-        if (isKeepaliveDue(fix)) {
-          lastSnapMonotonicT = fix.monotonicT
-          lastOutLat = fix.lat
-          lastOutLng = fix.lng
-          return Outcome.Snap(fix.lat, fix.lng, fix.t)
-        }
+      }
+      if (held == null) {
+        noteParked(fix)
+        if (isKeepaliveDue(fix)) return keepalive(fix)
       }
       return Outcome.Reject("jitter")
     }
@@ -207,16 +211,41 @@ class LocationGate<T>(
   }
 
   /**
-   * Parked keepalive rows: sparse and sharp. One every keepaliveMs at each fix's
-   * own position drew a 50-line scribble over a two-hour office stay at high zoom
-   * (indoor fixes wander 20-35 m); the anchor's exact coordinates every time were
-   * flagged as a fake location by the backend. Liveness meanwhile comes from the
-   * still-mode heartbeats.
+   * Parked points, one per [snapIntervalMs] so the newest point never says the
+   * phone went quiet. Each is the real fix that stayed nearest the previous
+   * point, so the line barely moves: production (Oct 2026), one keepalive every
+   * keepaliveMs at each fix's own position drew a 50-line scribble over a
+   * two-hour office stay, and replaying an indoor stay (fixes at 20-34 m) this
+   * way moved the line ~1 m per point instead of ~23 m. Never an exact repeat:
+   * the backend flags 20 pings with 0.000 m jitter as a spoofed location.
    */
+  private fun noteParked(fix: Fix) {
+    val lat = lastOutLat ?: return
+    val lng = lastOutLng ?: return
+    if (fix.lat == lat && fix.lng == lng) return
+    val m = haversineM(lat, lng, fix.lat, fix.lng)
+    if (m < parkedBestM) {
+      parkedBest = fix
+      parkedBestM = m
+    }
+  }
+
   private fun isKeepaliveDue(fix: Fix): Boolean =
-    fix.acc <= SNAP_MAX_ACC_M &&
-      (lastSnapMonotonicT?.let { fix.monotonicT - it >= snapIntervalMs } ?: true) &&
-      !(fix.lat == lastOutLat && fix.lng == lastOutLng)
+    parkedBest != null && (lastOutMonotonicT?.let { fix.monotonicT - it >= snapIntervalMs } ?: true)
+
+  private fun keepalive(now: Fix): Outcome<T> {
+    val b = parkedBest ?: return Outcome.Reject("jitter")
+    markOut(b.lat, b.lng, now.monotonicT)
+    return Outcome.Snap(b.lat, b.lng, now.t, b.acc)
+  }
+
+  private fun markOut(lat: Double, lng: Double, monotonicT: Long) {
+    lastOutLat = lat
+    lastOutLng = lng
+    lastOutMonotonicT = monotonicT
+    parkedBest = null
+    parkedBestM = Double.MAX_VALUE
+  }
 
   /**
    * Count [fix] towards the re-anchor candidate; true once [REANCHOR_COUNT]
@@ -246,14 +275,12 @@ class LocationGate<T>(
     val h = held ?: return null
     held = null
     emitted = h.fix
-    lastOutLat = h.fix.lat
-    lastOutLng = h.fix.lng
+    markOut(h.fix.lat, h.fix.lng, h.fix.monotonicT)
     return h.fix to h.payload
   }
 
   private fun release(h: Held<T>, d: Double, atStop: Boolean = false): Outcome<T> {
-    lastOutLat = h.fix.lat
-    lastOutLng = h.fix.lng
+    markOut(h.fix.lat, h.fix.lng, h.fix.monotonicT)
     return Outcome.Release(h.fix, h.payload, d, atStop)
   }
 
@@ -321,11 +348,8 @@ class LocationGate<T>(
     const val UNCONFIRMED_MIN_JUMP_M = 75.0
     const val UNCONFIRMED_ACC_FACTOR = 3.0
 
-    /** Parked keepalive rows: at most one per this interval... */
+    /** Parked points: one per this interval after the last written row. */
     const val SNAP_INTERVAL_MS = 10 * 60_000L
-
-    /** ...and only from a fix at least this accurate (indoor fixes wander 20-35 m). */
-    const val SNAP_MAX_ACC_M = 15.0
 
     /** A→B and B→C must both exceed this for B to be a zig-zag spur... */
     const val ZIGZAG_LEG_M = 100.0

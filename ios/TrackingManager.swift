@@ -305,11 +305,11 @@ final class TrackingManager: NSObject, CLLocationManagerDelegate {
     case .release(let released, let payload, _):
       noteAccepted(fix)
       writePoint(fix: released, meta: payload, act: "UNKNOWN", userId: cfg.userId)
-    case .snap(let lat, let lng, let snapT):
-      // Stationary keepalive: at most one real fix per keepalive interval instead
-      // of the jitter blob a parked device otherwise paints. Written as the fix
-      // itself (own position and speed), never a repeat of earlier coordinates.
-      let snapFix = LocationGate<PendingPoint>.Fix(lat: lat, lng: lng, acc: acc, t: snapT)
+    case .snap(let lat, let lng, let snapT, let snapAcc):
+      // Parked: one point per 10 min at the real recent fix the gate picked (with
+      // that fix's accuracy), stamped now so the newest point says the phone is
+      // still here. Never a repeat of earlier coordinates.
+      let snapFix = LocationGate<PendingPoint>.Fix(lat: lat, lng: lng, acc: snapAcc, t: snapT)
       writePoint(fix: snapFix, meta: pending, act: "STILL", userId: cfg.userId)
     }
   }
