@@ -160,16 +160,57 @@ class LocationGateTest {
     // A provider replay of p1's exact position adds nothing, and exact repeats
     // are what the backend reads as a spoofed location.
     assertEquals(Outcome.Reject("jitter"), g.eval(fix(0.0, 240.0), "p3"))
-    // The next genuinely new fix still keeps the phone alive on the map.
-    assertTrue(g.eval(fix(5.0, 250.0), "p4") is Outcome.Snap)
+    // The next genuinely new fix a keepalive interval later still keeps alive.
+    assertTrue(g.eval(fix(5.0, 360.0), "p4") is Outcome.Snap)
   }
 
-  @Test fun consecutiveKeepalivesNeverRepeatExactCoordinates() {
+  // --- parked keepalives: sparse and sharp ------------------------------------
+  // Production (Oct 2026): a keepalive every 2 min at each fix's own position
+  // drew a 50-line scribble over a two-hour office stay at high zoom.
+
+  @Test fun keepalivesAreAtLeastTenMinutesApart() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0), "p1")
+    g.eval(fix(3.0, 120.0), "p2") // releases p1
+    assertTrue(g.eval(fix(4.0, 240.0), "p3") is Outcome.Snap)
+    for (i in 1..4) {
+      assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0 + i, 240.0 + 120.0 * i), "q$i"))
+    }
+    assertTrue(g.eval(fix(2.0, 240.0 + 600.0), "p4") is Outcome.Snap)
+  }
+
+  @Test fun blurryFixNeverBecomesAKeepalive() {
     val g = gate()
     g.eval(fix(0.0, 0.0), "p1")
     g.eval(fix(3.0, 120.0), "p2")
-    assertTrue(g.eval(fix(4.0, 240.0), "p3") is Outcome.Snap)
-    assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0, 360.0), "p4"))
+    // 25 m accuracy indoors: within the jitter radius, but not sharp enough to draw.
+    assertEquals(Outcome.Reject("jitter"), g.eval(fix(4.0, 240.0, acc = 25.0), "p3"))
+  }
+
+  @Test fun parkedPhoneKeepsTheSpeedCheckStrictWithoutKeepalives() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 25.0, speed = 0.0), "p1")
+    // An hour parked with only blurry fixes: nothing is written...
+    for (i in 1..30) g.eval(fix(2.0, 120.0 * i, acc = 25.0, speed = 0.0), "j$i")
+    // ...but the time base kept up, so 3 km in 30 s is still a teleport.
+    assertEquals(Outcome.Reject("teleport"), g.eval(fix(3_000.0, 3_630.0, speed = 5.0), "far"))
+  }
+
+  // --- stationary drift --------------------------------------------------------
+  // Production (Oct 2026): parked indoors at 20-34 m accuracy, fixes 20-37 m away
+  // reporting 0 km/h were written as moves and drawn as lines across the road.
+
+  @Test fun zeroSpeedFixWithinTheCombinedAccuracyIsDrift() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 20.0, speed = 0.0), "p1")
+    assertEquals(Outcome.Reject("jitter"), g.eval(fix(36.0, 60.0, acc = 20.0, speed = 0.0), "p2"))
+  }
+
+  @Test fun walkingFixBeyondTheJitterRadiusIsStillAMove() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 20.0, speed = 0.0), "p1")
+    val out = g.eval(fix(36.0, 60.0, acc = 20.0, speed = 1.2), "p2")
+    assertTrue(out is Outcome.Release)
   }
 
   @Test fun keepaliveIsRateLimited() {

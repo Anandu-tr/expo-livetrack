@@ -134,6 +134,11 @@ interface Cadence {
 }
 ```
 
+How the cadence is applied on Android:
+
+- **Moving:** fixes are requested every 3 s (or `movingIntervalMs` if shorter). A point is written about every `movingIntervalMs`, plus wherever the heading turns by 30° or more over a 15 m+ leg, so corners are drawn instead of cut.
+- **Parked:** a fix that reports ~0 speed and moved less than its own plus the previous fix's accuracy is drift, not a move. Keepalive points are written at most every 10 min and only from fixes accurate to 15 m, so a parked phone shows as a dot. Liveness comes from the still-mode `HEARTBEAT` every `stillIntervalMs`.
+
 ### `TrackerState`
 
 ```ts

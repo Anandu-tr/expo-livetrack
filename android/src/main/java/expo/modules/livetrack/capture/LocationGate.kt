@@ -37,6 +37,7 @@ class LocationGate<T>(
   private val movingDistanceM: Double,
   private val maxAccuracyM: Double,
   private val keepaliveMs: Long,
+  private val snapIntervalMs: Long = SNAP_INTERVAL_MS,
 ) {
 
   /**
@@ -69,14 +70,23 @@ class LocationGate<T>(
     /** Accepted and held for the zig-zag lookahead; nothing to write yet. */
     data class Hold(val displacementM: Double) : Outcome<Nothing>()
 
-    /** The previously held fix is released for writing; the new fix is now held. */
-    data class Release<T>(val fix: Fix, val payload: T, val displacementM: Double) : Outcome<T>()
+    /**
+     * The previously held fix is released for writing; the new fix is now held.
+     * [atStop]: released because the device stayed put for a keepalive interval,
+     * i.e. it is the last real position before a stop and should always be drawn.
+     */
+    data class Release<T>(
+      val fix: Fix,
+      val payload: T,
+      val displacementM: Double,
+      val atStop: Boolean = false,
+    ) : Outcome<T>()
 
     /**
-     * Stationary keepalive: the caller should write a row for the triggering fix,
-     * at its own position (within the jitter radius of the anchor) and time [t].
-     * Emitted at most once per [keepaliveMs] while the device stays within the
-     * jitter radius, and never with the exact coordinates of the last written row.
+     * Parked keepalive: the caller should write a row for the triggering fix, at
+     * its own position (within the jitter radius of the anchor) and time [t].
+     * At most one per [snapIntervalMs], only from a fix at least [SNAP_MAX_ACC_M]
+     * accurate, and never with the exact coordinates of the last written row.
      */
     data class Snap(val lat: Double, val lng: Double, val t: Long) : Outcome<Nothing>()
   }
@@ -89,7 +99,7 @@ class LocationGate<T>(
   /** Accepted fix awaiting the lookahead vote. */
   private var held: Held<T>? = null
 
-  /** Monotonic time base for dt. Advances on accept and on every Snap. */
+  /** Monotonic time base for dt. Advances on accept and on every keepalive interval spent in place. */
   private var anchorMonotonicT: Long = 0L
 
   // Re-anchor candidate, shared by the teleport and unconfirmed-jump gates: both
@@ -105,6 +115,9 @@ class LocationGate<T>(
   // Coordinates of the last row handed out for writing (release or keepalive).
   private var lastOutLat: Double? = null
   private var lastOutLng: Double? = null
+
+  /** Monotonic time of the last keepalive handed out; null = none yet. */
+  private var lastSnapMonotonicT: Long? = null
 
   /** The fix everything is measured against: the held one if any, else the last released. */
   private val anchor: Fix?
@@ -135,27 +148,25 @@ class LocationGate<T>(
       return if (confirmCandidate(fix)) accept(fix, payload, d) else Outcome.Reject("teleport")
     }
 
-    if (d < max(movingDistanceM, fix.acc)) {
+    if (d < max(movingDistanceM, fix.acc) || isDrift(fix, a, d)) {
       cCount = 0
       if (dt >= keepaliveMs) {
+        // Still here after a keepalive interval: refresh the time base even when
+        // nothing is written, so the speed check stays strict for a parked phone.
+        anchorMonotonicT = fix.monotonicT
         val h = held
         if (h != null) {
-          // The held real fix doubles as the keepalive.
-          anchorMonotonicT = fix.monotonicT
+          // The held real fix doubles as the keepalive: the last position before the stop.
           held = null
           emitted = h.fix
-          return release(h, d)
+          return release(h, d, atStop = true)
         }
-        // Keepalive at the fix's own position, not the anchor's: the anchor's
-        // exact coordinates repeated every keepaliveMs were flagged as a fake
-        // location by the backend (production, Oct 2026). An exact repeat of the
-        // last written row (a provider cache replay) adds nothing; skip it and
-        // let the next distinct fix keep the phone alive.
-        if (fix.lat == lastOutLat && fix.lng == lastOutLng) return Outcome.Reject("jitter")
-        anchorMonotonicT = fix.monotonicT
-        lastOutLat = fix.lat
-        lastOutLng = fix.lng
-        return Outcome.Snap(fix.lat, fix.lng, fix.t)
+        if (isKeepaliveDue(fix)) {
+          lastSnapMonotonicT = fix.monotonicT
+          lastOutLat = fix.lat
+          lastOutLng = fix.lng
+          return Outcome.Snap(fix.lat, fix.lng, fix.t)
+        }
       }
       return Outcome.Reject("jitter")
     }
@@ -176,12 +187,36 @@ class LocationGate<T>(
    * accepted fix. Genuine moves either carry speed (GNSS) or repeat at the new
    * place, which [confirmCandidate] accepts.
    */
-  private fun isUnconfirmedJump(fix: Fix, d: Double): Boolean {
+  private fun isUnconfirmedJump(fix: Fix, d: Double): Boolean =
+    claimsStationary(fix) && d > max(UNCONFIRMED_MIN_JUMP_M, UNCONFIRMED_ACC_FACTOR * fix.acc)
+
+  /**
+   * Stationary drift: a fix claiming no motion that landed within the two fixes'
+   * combined accuracy of the anchor. Production (Oct 2026): parked indoors at
+   * 20-34 m accuracy, fixes 20-37 m away at 0 km/h were written as moves and
+   * drawn as lines across the road.
+   */
+  private fun isDrift(fix: Fix, anchor: Fix, d: Double): Boolean =
+    claimsStationary(fix) && d < fix.acc + anchor.acc
+
+  /** No motion of its own (speed missing or ~0) and no recent fix that proved motion. */
+  private fun claimsStationary(fix: Fix): Boolean {
     val reportsNoMotion = fix.speedMps == null || fix.speedMps < STILL_SPEED_MPS
     val recentMotion = lastMotionMonotonicT?.let { fix.monotonicT - it <= MOTION_MEMORY_MS } ?: false
-    return reportsNoMotion && !recentMotion &&
-      d > max(UNCONFIRMED_MIN_JUMP_M, UNCONFIRMED_ACC_FACTOR * fix.acc)
+    return reportsNoMotion && !recentMotion
   }
+
+  /**
+   * Parked keepalive rows: sparse and sharp. One every keepaliveMs at each fix's
+   * own position drew a 50-line scribble over a two-hour office stay at high zoom
+   * (indoor fixes wander 20-35 m); the anchor's exact coordinates every time were
+   * flagged as a fake location by the backend. Liveness meanwhile comes from the
+   * still-mode heartbeats.
+   */
+  private fun isKeepaliveDue(fix: Fix): Boolean =
+    fix.acc <= SNAP_MAX_ACC_M &&
+      (lastSnapMonotonicT?.let { fix.monotonicT - it >= snapIntervalMs } ?: true) &&
+      !(fix.lat == lastOutLat && fix.lng == lastOutLng)
 
   /**
    * Count [fix] towards the re-anchor candidate; true once [REANCHOR_COUNT]
@@ -216,10 +251,10 @@ class LocationGate<T>(
     return h.fix to h.payload
   }
 
-  private fun release(h: Held<T>, d: Double): Outcome<T> {
+  private fun release(h: Held<T>, d: Double, atStop: Boolean = false): Outcome<T> {
     lastOutLat = h.fix.lat
     lastOutLng = h.fix.lng
-    return Outcome.Release(h.fix, h.payload, d)
+    return Outcome.Release(h.fix, h.payload, d, atStop)
   }
 
   private fun accept(fix: Fix, payload: T, d: Double): Outcome<T> {
@@ -285,6 +320,12 @@ class LocationGate<T>(
      */
     const val UNCONFIRMED_MIN_JUMP_M = 75.0
     const val UNCONFIRMED_ACC_FACTOR = 3.0
+
+    /** Parked keepalive rows: at most one per this interval... */
+    const val SNAP_INTERVAL_MS = 10 * 60_000L
+
+    /** ...and only from a fix at least this accurate (indoor fixes wander 20-35 m). */
+    const val SNAP_MAX_ACC_M = 15.0
 
     /** A→B and B→C must both exceed this for B to be a zig-zag spur... */
     const val ZIGZAG_LEG_M = 100.0

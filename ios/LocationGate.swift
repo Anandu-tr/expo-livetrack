@@ -26,6 +26,10 @@ enum LocationGateLimits {
   /// A stationary-claiming fix further than max(this, factor x acc) needs confirmation.
   static let unconfirmedMinJumpM = 75.0
   static let unconfirmedAccFactor = 3.0
+  /// Parked keepalive rows: at most one per this interval...
+  static let snapIntervalMs: Int64 = 600_000
+  /// ...and only from a fix at least this accurate (indoor fixes wander 20-35 m).
+  static let snapMaxAccM = 15.0
 
   private static let earthRadiusM = 6_371_000.0
 
@@ -93,6 +97,8 @@ final class LocationGate<T> {
   /// Coordinates of the last row handed out for writing (release or keepalive).
   private var lastOutLat: Double?
   private var lastOutLng: Double?
+  /// Time of the last keepalive handed out.
+  private var lastSnapT: Int64?
 
   init(movingDistanceM: Double, maxAccuracyM: Double, keepaliveMs: Double) {
     self.movingDistanceM = movingDistanceM
@@ -123,23 +129,23 @@ final class LocationGate<T> {
       return confirmCandidate(fix) ? accept(fix: fix, payload: payload, d: d) : .reject("teleport")
     }
 
-    if d < max(movingDistanceM, fix.acc) {
+    if d < max(movingDistanceM, fix.acc) || isDrift(fix, anchor: a, d: d) {
       cCount = 0
       if dt >= keepaliveMs {
+        // Still here after a keepalive interval: refresh the time base even when
+        // nothing is written, so the speed check stays strict while parked.
+        anchorT = fix.t
         if let h = held {
-          anchorT = fix.t
           held = nil
           emitted = h.fix
           return release(h, d: d)
         }
-        // Keepalive at the fix's own position: the anchor's exact coordinates
-        // repeated every keepalive were flagged as a fake location by the backend.
-        // An exact repeat of the last written row adds nothing; skip it.
-        if fix.lat == lastOutLat && fix.lng == lastOutLng { return .reject("jitter") }
-        anchorT = fix.t
-        lastOutLat = fix.lat
-        lastOutLng = fix.lng
-        return .snap(lat: fix.lat, lng: fix.lng, t: fix.t)
+        if isKeepaliveDue(fix) {
+          lastSnapT = fix.t
+          lastOutLat = fix.lat
+          lastOutLng = fix.lng
+          return .snap(lat: fix.lat, lng: fix.lng, t: fix.t)
+        }
       }
       return .reject("jitter")
     }
@@ -155,10 +161,28 @@ final class LocationGate<T> {
   /// A big jump from a fix reporting no motion of its own, with no recent fix that
   /// did (parked-phone scatter). See the Android gate for the production case.
   private func isUnconfirmedJump(_ fix: Fix, d: Double) -> Bool {
+    claimsStationary(fix) &&
+      d > max(LocationGateLimits.unconfirmedMinJumpM, LocationGateLimits.unconfirmedAccFactor * fix.acc)
+  }
+
+  /// Stationary drift: a fix claiming no motion within the two fixes' combined
+  /// accuracy of the anchor (indoor fixes wander 20-37 m without moving).
+  private func isDrift(_ fix: Fix, anchor: Fix, d: Double) -> Bool {
+    claimsStationary(fix) && d < fix.acc + anchor.acc
+  }
+
+  /// No motion of its own and no recent fix that proved motion.
+  private func claimsStationary(_ fix: Fix) -> Bool {
     let reportsNoMotion = (fix.speedMps ?? 0) < LocationGateLimits.stillSpeedMps
     let recentMotion = lastMotionT.map { fix.t - $0 <= LocationGateLimits.motionMemoryMs } ?? false
-    return reportsNoMotion && !recentMotion &&
-      d > max(LocationGateLimits.unconfirmedMinJumpM, LocationGateLimits.unconfirmedAccFactor * fix.acc)
+    return reportsNoMotion && !recentMotion
+  }
+
+  /// Parked keepalive rows: sparse, sharp, never an exact repeat (see the Android gate).
+  private func isKeepaliveDue(_ fix: Fix) -> Bool {
+    fix.acc <= LocationGateLimits.snapMaxAccM &&
+      (lastSnapT.map { fix.t - $0 >= LocationGateLimits.snapIntervalMs } ?? true) &&
+      !(fix.lat == lastOutLat && fix.lng == lastOutLng)
   }
 
   /// Count `fix` towards the re-anchor candidate; true once enough agree.

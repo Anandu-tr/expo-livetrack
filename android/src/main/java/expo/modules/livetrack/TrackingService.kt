@@ -48,6 +48,7 @@ import expo.modules.livetrack.buffer.PointDao
 import expo.modules.livetrack.buffer.PointEntity
 import expo.modules.livetrack.capture.GateStats
 import expo.modules.livetrack.capture.LocationGate
+import expo.modules.livetrack.capture.TurnSampler
 import expo.modules.livetrack.keepalive.KillStats
 import expo.modules.livetrack.keepalive.ProcessExits
 import expo.modules.livetrack.keepalive.Watchdog
@@ -98,6 +99,9 @@ class TrackingService : Service() {
 
   // Noise gate; rebuilt on every (re)start so a fresh start() resets the anchor.
   private var gate: LocationGate<PointEntity>? = null
+
+  // Picks which accepted moving fixes become points (interval + turns).
+  private var sampler = TurnSampler(movingIntervalMs)
 
   // Motion state.
   @Volatile private var isStill: Boolean = false
@@ -498,6 +502,7 @@ class TrackingService : Service() {
     // A (re)start means a fresh anchor; release anything the old gate still held.
     flushGate()
     gate = newGate()
+    sampler = TurnSampler(movingIntervalMs)
   }
 
   private fun newGate() = LocationGate<PointEntity>(
@@ -585,7 +590,9 @@ class TrackingService : Service() {
   }
 
   private fun startLocationUpdates() {
-    val intervalMs = if (isStill) stillIntervalMs else movingIntervalMs
+    // Moving: fixes every few seconds so turns can be caught; TurnSampler still
+    // writes a point only about every movingIntervalMs plus at the turns.
+    val intervalMs = if (isStill) stillIntervalMs else minOf(movingIntervalMs, MOVING_FIX_INTERVAL_MS)
     val request = buildLocationRequest(intervalMs, isStill)
     try {
       // Permission is the caller's responsibility (requested via the module);
@@ -662,7 +669,10 @@ class TrackingService : Service() {
       is LocationGate.Outcome.Release -> {
         stats.accepted()
         noteAccepted(loc, out.displacementM)
-        writePoint(out.payload)
+        val p = out.payload
+        // The last position before a stop is always drawn; moving fixes only
+        // when due (interval) or at a turn.
+        if (out.atStop || sampler.shouldWrite(p.lat ?: 0.0, p.lng ?: 0.0, p.t)) writePoint(p)
       }
       is LocationGate.Outcome.Snap -> {
         stats.snap()
@@ -716,6 +726,7 @@ class TrackingService : Service() {
         reporter.recordFailure("db-write", it.message ?: "insert(location) failed", mapOf("hasLocation" to "true"))
       }
     }
+    if (point.lat != null && point.lng != null) sampler.written(point.lat, point.lng, point.t)
 
     // Nudge the uploader after buffering a fix (unique+KEEP, so cheap to repeat).
     expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext)
@@ -1198,6 +1209,10 @@ class TrackingService : Service() {
     // No working internet for this long counts as an outage (NET_OFF), timed from
     // its start; Wi-Fi / mobile handovers drop connectivity for seconds.
     private const val NET_OFF_CONFIRM_MS = 2 * 60_000L
+
+    // Fix cadence while moving. At 10 s (a quarter of slots skipped by the
+    // provider) city turns fell between points and were drawn as diagonals.
+    private const val MOVING_FIX_INTERVAL_MS = 3_000L
 
     const val ACTION_ACTIVITY_TRANSITION = "expo.modules.livetrack.ACTION_ACTIVITY_TRANSITION"
     const val ACTION_ACTIVITY_SAMPLE = "expo.modules.livetrack.ACTION_ACTIVITY_SAMPLE"
