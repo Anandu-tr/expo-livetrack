@@ -28,6 +28,9 @@ enum LocationGateLimits {
   static let unconfirmedAccFactor = 3.0
   /// Parked points: one per this interval after the last written row.
   static let snapIntervalMs: Int64 = 600_000
+  /// A parked fix within this of the last point is written as it is; a farther one
+  /// (indoor fixes stray 20-30 m) is replaced by the fix that stayed nearest.
+  static let parkedCloseM = 3.0
 
   private static let earthRadiusM = 6_371_000.0
 
@@ -69,8 +72,9 @@ final class LocationGate<T> {
     /// The previously held fix is released for writing; the new fix is now held.
     case release(fix: Fix, payload: T, displacementM: Double)
     /// Parked point: write a row at lat/lng with accuracy `acc`, stamped with the
-    /// current fix's time `t`. The position is the real fix seen since the last
-    /// written row that stayed nearest it, never that row's exact coordinates.
+    /// current fix's time `t`. The position is the current fix, or, when that strays
+    /// more than `parkedCloseM` from the last written row, the fix seen since then
+    /// that stayed nearest it; never that row's exact coordinates.
     case snap(lat: Double, lng: Double, t: Int64, acc: Double)
   }
 
@@ -180,8 +184,9 @@ final class LocationGate<T> {
     return reportsNoMotion && !recentMotion
   }
 
-  /// Parked points: one per snapIntervalMs, each the real fix that stayed nearest
-  /// the previous point, never an exact repeat (see the Android gate).
+  /// Parked points: one per snapIntervalMs, each the current fix when it stays within
+  /// parkedCloseM of the previous point, otherwise the fix that stayed nearest it;
+  /// never an exact repeat (see the Android gate).
   private func noteParked(_ fix: Fix) {
     guard let lat = lastOutLat, let lng = lastOutLng else { return }
     if fix.lat == lat && fix.lng == lng { return }
@@ -197,9 +202,18 @@ final class LocationGate<T> {
   }
 
   private func keepalive(now: Fix) -> Outcome {
-    guard let b = parkedBest else { return .reject("jitter") }
+    guard let b = staysClose(now) ? now : parkedBest else { return .reject("jitter") }
     markOut(lat: b.lat, lng: b.lng, t: now.t)
     return .snap(lat: b.lat, lng: b.lng, t: now.t, acc: b.acc)
+  }
+
+  /// The current fix is close enough to the last point to be written as it is: always
+  /// writing the nearest fix stripped the natural jitter the backend's spoofing check
+  /// looks for (see the Android gate).
+  private func staysClose(_ fix: Fix) -> Bool {
+    guard let lat = lastOutLat, let lng = lastOutLng else { return false }
+    if fix.lat == lat && fix.lng == lng { return false }
+    return LocationGateLimits.haversineM(lat, lng, fix.lat, fix.lng) <= LocationGateLimits.parkedCloseM
   }
 
   private func markOut(lat: Double, lng: Double, t: Int64) {

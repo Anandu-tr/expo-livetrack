@@ -40,6 +40,7 @@ class DeviceStateEventsTest {
   @After
   fun tearDown() {
     db.close()
+    TrackedPosition.latLng = null
   }
 
   private val prefs get() = context.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
@@ -89,6 +90,18 @@ class DeviceStateEventsTest {
     val e = events().single()
     assertEquals("LOCATION_OFF", e.eventType)
     assertNull(e.act)
+  }
+
+  @Test
+  fun locationOffCarriesTheTrackedPosition() {
+    // Production (Oct 2026): every LOCATION_OFF/ON row came without a position,
+    // because the system's last-known location is null while the provider is off.
+    prefs.edit().putBoolean(Prefs.KEY_LAST_LOCATION_ENABLED, true).commit()
+    gps(false)
+    TrackedPosition.latLng = 9.9601 to 76.2891
+    DeviceStateEvents.checkLocation(context, dao, reason = null)
+    val e = events().single()
+    assertEquals(9.9601 to 76.2891, e.lat to e.lng)
   }
 
   @Test

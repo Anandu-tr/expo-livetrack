@@ -106,7 +106,17 @@ test("parkedPointIsWrittenTenMinutesAfterTheStop") {
   let s = snap(g.eval(fix(4, 600), "p3"))
   check(s?.t == t0 + 600_000, "\(String(describing: s))")
 }
-test("parkedPointIsTheRealFixNearestTheLastOne") {
+test("parkedPointIsTheCurrentFixWhenItStaysClose") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "p1")
+  _ = g.eval(fix(0.3, 120, speed: 0), "p2")
+  _ = g.eval(fix(-1.5, 240, speed: 0), "p3")
+  let s = snap(g.eval(fix(2, 600, acc: 12, speed: 0, dLngM: 1), "now"))
+  let now = fix(2, 600, dLngM: 1)
+  check(s?.lat == now.lat && s?.lng == now.lng, "\(String(describing: s))")
+  check(s?.acc == 12, "acc \(String(describing: s?.acc))")
+}
+test("parkedPointFallsBackToTheNearestFixWhenTheCurrentOneStrays") {
   let g = gate()
   _ = g.eval(fix(0, 0, speed: 0), "p1")
   _ = g.eval(fix(12, 120, acc: 20, speed: 0), "p2")
@@ -267,6 +277,61 @@ test("holdReportsDisplacementFromAnchor") {
   _ = g.flush()
   let d = holdD(g.eval(fix(150, 120), "b"))
   check(d != nil && abs(d! - 150) < 2, "\(String(describing: d))")
+}
+
+// --- replayed still nights vs the backend's spoofing check --------------------------
+// Same recorded nights as the Android ParkedReplayTest (offsets only, no position).
+
+struct Written { let lat: Double; let lng: Double; let t: Int64 }
+
+/// The backend's rule (noJitterTrap): 20 consecutive points whose distances from their
+/// centroid have a standard deviation under 0.5 m, all within 2 m of it, spanning > 10 min.
+func backendFlags(_ w: ArraySlice<Written>) -> Bool {
+  let n = Double(w.count)
+  let cLat = w.reduce(0) { $0 + $1.lat } / n
+  let cLng = w.reduce(0) { $0 + $1.lng } / n
+  let d = w.map { LocationGateLimits.haversineM(cLat, cLng, $0.lat, $0.lng) }
+  let mean = d.reduce(0, +) / n
+  let sd = (d.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / n).squareRoot()
+  return sd < 0.5 && (d.max() ?? 0) < 2 && w.last!.t - w.first!.t > 600_000
+}
+
+func replay(_ name: String) -> [Written] {
+  let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    .appendingPathComponent("../android/src/test/resources/parked/\(name)")
+  guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+    check(false, "cannot read \(url.path)")
+    return []
+  }
+  let g = LocationGate<Int>(movingDistanceM: 20, maxAccuracyM: 35, keepaliveMs: 120_000)
+  var out: [Written] = []
+  let rows = text.split(separator: "\n").filter { !$0.hasPrefix("#") && !$0.isEmpty }
+  for (i, line) in rows.enumerated() {
+    let v = line.split(separator: ",").map { Double($0)! }
+    let t = t0 + Int64(v[0] * 1000)
+    let f = LocationGate<Int>.Fix(
+      lat: lat0 + v[1] / 111_000.0, lng: lng0 + v[2] / (111_000.0 * cos(lat0 * .pi / 180)),
+      acc: v[3], t: t, speedMps: 0)
+    switch g.evaluate(fix: f, ageMs: 0, payload: i) {
+    case .release(let fx, _, _): out.append(Written(lat: fx.lat, lng: fx.lng, t: fx.t))
+    case .snap(let la, let ln, let ts, _): out.append(Written(lat: la, lng: ln, t: ts))
+    default: break
+    }
+  }
+  return out
+}
+
+test("theBackendRuleHereFlagsExactRepeats") {
+  let repeats = (0..<20).map { Written(lat: 9.98, lng: 76.38, t: Int64($0) * 150_000) }
+  check(backendFlags(repeats[...]), "exact repeats not flagged")
+}
+test("stillNightsNeverTripTheBackendSpoofingCheck") {
+  for night in ["still-night-1.csv", "still-night-2.csv"] {
+    let w = replay(night)
+    check(w.count >= 45, "\(night) wrote \(w.count) points")
+    let flagged = w.count >= 20 ? (0...(w.count - 20)).filter { backendFlags(w[$0..<($0 + 20)]) }.count : 0
+    check(flagged == 0, "\(night): \(flagged) windows the backend would flag")
+  }
 }
 
 print("swift gate spec: \(passed) passed, \(failures) failed")

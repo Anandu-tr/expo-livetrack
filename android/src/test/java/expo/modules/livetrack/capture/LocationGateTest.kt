@@ -156,17 +156,33 @@ class LocationGateTest {
     assertEquals(t0 + 600_000L, (out as Outcome.Snap).t)
   }
 
-  @Test fun parkedPointIsTheRealFixNearestTheLastOne() {
+  @Test fun parkedPointIsTheCurrentFixWhenItStaysClose() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
+    g.eval(fix(0.3, 120.0, speed = 0.0), "p2") // releases p1 at lat0; the closest fix of the window
+    g.eval(fix(-1.5, 240.0, speed = 0.0), "p3")
+    val out = g.eval(fix(2.0, 600.0, acc = 12.0, speed = 0.0, dLngM = 1.0), "now") // 2.2 m from p1
+    assertTrue(out is Outcome.Snap)
+    val snap = out as Outcome.Snap
+    // Written as it is: always picking the closest fix strips the natural jitter
+    // the backend's spoofing check looks for (it flags 20 pings within 0.5 m).
+    val now = fix(2.0, 600.0, dLngM = 1.0)
+    assertEquals(now.lat, snap.lat, 1e-12)
+    assertEquals(now.lng, snap.lng, 1e-12)
+    assertEquals(12.0, snap.acc, 1e-9)
+  }
+
+  @Test fun parkedPointFallsBackToTheNearestFixWhenTheCurrentOneStrays() {
     val g = gate()
     g.eval(fix(0.0, 0.0, speed = 0.0), "p1")
     g.eval(fix(12.0, 120.0, acc = 20.0, speed = 0.0), "p2") // releases p1 at lat0
     g.eval(fix(-2.0, 240.0, acc = 25.0, speed = 0.0, dLngM = 1.0), "near")
     g.eval(fix(15.0, 360.0, acc = 20.0, speed = 0.0, dLngM = -8.0), "p4")
-    val out = g.eval(fix(18.0, 600.0, acc = 20.0, speed = 0.0), "p5")
+    val out = g.eval(fix(18.0, 600.0, acc = 20.0, speed = 0.0), "p5") // 18 m from p1
     assertTrue(out is Outcome.Snap)
     val snap = out as Outcome.Snap
-    // A real fix (natural jitter, never synthesised) with its own accuracy, but
-    // the one that stayed nearest p1, so the drawn line barely moves.
+    // Indoors the current fix can be 20-30 m off: the real fix that stayed
+    // nearest p1 is written instead (with its own accuracy), so the line barely moves.
     val near = fix(-2.0, 240.0, dLngM = 1.0)
     assertEquals(near.lat, snap.lat, 1e-12)
     assertEquals(near.lng, snap.lng, 1e-12)

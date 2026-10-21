@@ -68,7 +68,9 @@ internal object DeviceStateEvents {
     val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return false
     val enabled = runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)
     if (!changed(context, Prefs.KEY_LAST_LOCATION_ENABLED, enabled, recordFirst = true)) return false
-    val (lat, lng) = lastKnown(context, lm)
+    // The system's last-known location is null while the provider is off (and
+    // just after it comes back): every such row used to carry no position.
+    val (lat, lng) = TrackedPosition.latLng ?: lastKnown(context, lm)
     record(context, dao, if (enabled) "LOCATION_ON" else "LOCATION_OFF", reason, lat, lng)
     return true
   }

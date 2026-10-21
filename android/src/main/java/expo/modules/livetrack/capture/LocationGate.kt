@@ -84,9 +84,10 @@ class LocationGate<T>(
 
     /**
      * Parked point: the caller writes a row at [lat]/[lng] with accuracy [acc],
-     * stamped with the current fix's time [t]. The position is a real fix seen
-     * since the last written row (the one nearest that row), never that row's
-     * exact coordinates. Due [snapIntervalMs] after the last written row.
+     * stamped with the current fix's time [t]. The position is the current fix,
+     * or, when that strays more than [PARKED_CLOSE_M] from the last written row,
+     * the fix seen since then that stayed nearest it; never that row's exact
+     * coordinates. Due [snapIntervalMs] after the last written row.
      */
     data class Snap(val lat: Double, val lng: Double, val t: Long, val acc: Double) : Outcome<Nothing>()
   }
@@ -212,12 +213,14 @@ class LocationGate<T>(
 
   /**
    * Parked points, one per [snapIntervalMs] so the newest point never says the
-   * phone went quiet. Each is the real fix that stayed nearest the previous
-   * point, so the line barely moves: production (Oct 2026), one keepalive every
-   * keepaliveMs at each fix's own position drew a 50-line scribble over a
-   * two-hour office stay, and replaying an indoor stay (fixes at 20-34 m) this
-   * way moved the line ~1 m per point instead of ~23 m. Never an exact repeat:
-   * the backend flags 20 pings with 0.000 m jitter as a spoofed location.
+   * phone went quiet. Each is the current fix when it stays within
+   * [PARKED_CLOSE_M] of the previous point, otherwise the real fix that stayed
+   * nearest it, so the line barely moves yet keeps GPS's natural jitter.
+   * Production (Oct 2026): one keepalive every keepaliveMs at each fix's own
+   * position drew a 50-line scribble over a two-hour office stay; replaying an
+   * indoor stay (fixes at 20-34 m) this way moves the line ~2 m per point instead
+   * of ~23 m. Never an exact repeat: the backend flags 20 consecutive points as
+   * spoofing when their distances from the centroid vary by under 0.5 m.
    */
   private fun noteParked(fix: Fix) {
     val lat = lastOutLat ?: return
@@ -234,9 +237,22 @@ class LocationGate<T>(
     parkedBest != null && (lastOutMonotonicT?.let { fix.monotonicT - it >= snapIntervalMs } ?: true)
 
   private fun keepalive(now: Fix): Outcome<T> {
-    val b = parkedBest ?: return Outcome.Reject("jitter")
+    val b = if (staysClose(now)) now else parkedBest ?: return Outcome.Reject("jitter")
     markOut(b.lat, b.lng, now.monotonicT)
     return Outcome.Snap(b.lat, b.lng, now.t, b.acc)
+  }
+
+  /**
+   * The current fix is close enough to the last point to be written as it is.
+   * Always writing the nearest fix instead stripped the natural jitter: replayed
+   * still nights then fell inside the backend's spoofing check (20 points within
+   * 0.5 m) in 25 of 32 windows.
+   */
+  private fun staysClose(fix: Fix): Boolean {
+    val lat = lastOutLat ?: return false
+    val lng = lastOutLng ?: return false
+    if (fix.lat == lat && fix.lng == lng) return false
+    return haversineM(lat, lng, fix.lat, fix.lng) <= PARKED_CLOSE_M
   }
 
   private fun markOut(lat: Double, lng: Double, monotonicT: Long) {
@@ -350,6 +366,12 @@ class LocationGate<T>(
 
     /** Parked points: one per this interval after the last written row. */
     const val SNAP_INTERVAL_MS = 10 * 60_000L
+
+    /**
+     * A parked fix within this of the last point is written as it is; a farther
+     * one (indoor fixes stray 20-30 m) is replaced by the fix that stayed nearest.
+     */
+    const val PARKED_CLOSE_M = 3.0
 
     /** A→B and B→C must both exceed this for B to be a zig-zag spur... */
     const val ZIGZAG_LEG_M = 100.0

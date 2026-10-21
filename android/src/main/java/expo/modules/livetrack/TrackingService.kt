@@ -443,6 +443,8 @@ class TrackingService : Service() {
   override fun onDestroy() {
     isRunning = false
     if (instance === this) instance = null
+    // Not tracking any more: a later LOCATION_OFF/ON must not carry a stale position.
+    TrackedPosition.latLng = null
     heartbeatHandler.removeCallbacks(heartbeatTick)
     graceHandler.removeCallbacks(graceTick)
     maintenanceHandler.removeCallbacks(maintenanceTick)
@@ -719,6 +721,7 @@ class TrackingService : Service() {
   private fun noteAccepted(loc: Location, displacementM: Double) {
     lastLat = loc.latitude
     lastLng = loc.longitude
+    TrackedPosition.latLng = loc.latitude to loc.longitude
     // Activity Recognition can sit in STILL for an entire ride (observed: 120 s
     // cadence over 9 km, with gaps of up to an hour). Real displacement is the
     // ground truth, so leave still mode from here instead of waiting for AR.
