@@ -219,12 +219,14 @@ class LocationGate<T>(
     if (dtS <= 0.0 || dtS > PACE_CHECK_MAX_DT_S) return true // too long ago to say
     val pace = max(fix.speedMps ?: 0.0, ref.speedMps ?: 0.0)
     if (pace >= WALKING_PACE_MAX_MPS) return true // vehicle speeds: the speed ceiling judges
-    // Neither reports motion, yet motion is vouched for: no pace to judge by. Some
-    // phones' network fixes report 0 rather than no speed (c21a1207, Oct 30, in a
-    // vehicle), and were rejected here as if the phone had crawled.
-    if (pace < STILL_SPEED_MPS && !claimsStationary(fix)) return true
+    // Neither reports any speed at all, yet motion is vouched for: no pace to judge
+    // by. Some phones' network fixes report exactly 0 rather than no speed
+    // (c21a1207, Oct 30, in a vehicle). A small measured speed is still a pace: the
+    // Oct 29 walking scatter reported 0.2-0.5 km/h.
+    if (pace == 0.0 && !claimsStationary(fix)) return true
+    val factor = if (pace >= MOTION_SPEED_MPS) PACE_FACTOR_RIDING else PACE_FACTOR
     val d = haversineM(ref.lat, ref.lng, fix.lat, fix.lng)
-    return d <= max(UNCONFIRMED_MIN_JUMP_M, PACE_FACTOR * pace * dtS + fix.acc + ref.acc + PACE_MARGIN_M)
+    return d <= max(UNCONFIRMED_MIN_JUMP_M, factor * pace * dtS + fix.acc + ref.acc + PACE_MARGIN_M)
   }
 
   /**
@@ -523,6 +525,11 @@ class LocationGate<T>(
     const val WALKING_PACE_MAX_MPS = 3.0
     /** ...which is this many times that pace over the time since the reference fix... */
     const val PACE_FACTOR = 2.0
+    /**
+     * ...or this many from [MOTION_SPEED_MPS] up: in stop-and-go traffic GNSS
+     * reported a third of the pace kept between fixes (ff2b57e4, Oct 30)...
+     */
+    const val PACE_FACTOR_RIDING = 3.0
     /** ...plus both fixes' accuracy and this margin... */
     const val PACE_MARGIN_M = 20.0
     /** ...judged only this soon after the reference fix: an older one says little about pace. */

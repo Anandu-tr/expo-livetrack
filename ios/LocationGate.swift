@@ -34,9 +34,11 @@ enum LocationGateLimits {
   /// (indoor fixes stray 20-30 m) is replaced by the fix that stayed nearest.
   static let parkedCloseM = 3.0
   /// Below this reported speed (on foot) a fix must stay within what its pace explains:
-  /// paceFactor x pace x dt, plus both accuracies and paceMarginM, within paceCheckMaxDtS.
+  /// paceFactor x pace x dt, plus both accuracies and paceMarginM, within paceCheckMaxDtS;
+  /// paceFactorRiding from motionSpeedMps up (stop-and-go traffic, see the Android gate).
   static let walkingPaceMaxMps = 3.0
   static let paceFactor = 2.0
+  static let paceFactorRiding = 3.0
   static let paceMarginM = 20.0
   static let paceCheckMaxDtS = 180.0
   /// Far fixes heading away together count as travel: at least travelMinFixes of them,
@@ -360,13 +362,14 @@ final class LocationGate<T> {
     if dtS <= 0 || dtS > LocationGateLimits.paceCheckMaxDtS { return true }
     let pace = max(fix.speedMps ?? 0, ref.speedMps ?? 0)
     if pace >= LocationGateLimits.walkingPaceMaxMps { return true }
-    // Neither reports motion, yet motion is vouched for: no pace to judge by
-    // (network fixes reporting 0 rather than no speed; see the Android gate).
-    if pace < LocationGateLimits.stillSpeedMps && !claimsStationary(fix) { return true }
+    // Neither reports any speed at all (exactly 0), yet motion is vouched for: no pace
+    // to judge by. A small measured speed is still a pace (see the Android gate).
+    if pace == 0 && !claimsStationary(fix) { return true }
+    let factor = pace >= LocationGateLimits.motionSpeedMps ? LocationGateLimits.paceFactorRiding : LocationGateLimits.paceFactor
     let d = LocationGateLimits.haversineM(ref.lat, ref.lng, fix.lat, fix.lng)
     return d <= max(
       LocationGateLimits.unconfirmedMinJumpM,
-      LocationGateLimits.paceFactor * pace * dtS + fix.acc + ref.acc + LocationGateLimits.paceMarginM
+      factor * pace * dtS + fix.acc + ref.acc + LocationGateLimits.paceMarginM
     )
   }
 

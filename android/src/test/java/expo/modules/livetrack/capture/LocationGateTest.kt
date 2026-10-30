@@ -520,6 +520,25 @@ class LocationGateTest {
     assertTrue(gate().walk(12).drop(1).all { it is Outcome.Release })
   }
 
+  // Oct 30, 15:55 (ff2b57e4): stop-and-go traffic, GNSS reporting 3-10 km/h while
+  // the bike covered 5-7 m/s between fixes; held to twice that pace, a real ride
+  // was cut into straight segments of up to 1 km.
+  @Test fun stopAndGoTrafficIsNotMistakenForWalkingScatter() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.6), "a0")
+    g.eval(fix(63.0, 12.0, speed = 0.83), "a")
+    // 169 m on in 23 s, reporting 9.6 km/h.
+    val out = g.eval(fix(232.0, 35.0, speed = 2.67), "b")
+    assertTrue("was $out", out is Outcome.Release)
+  }
+
+  @Test fun briskWalkingKeepsTheTighterAllowance() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 1.9), "a0")
+    g.eval(fix(63.0, 12.0, speed = 1.9), "a")
+    assertEquals(Outcome.Reject("inconsistent"), g.eval(fix(232.0, 35.0, speed = 1.9), "b"))
+  }
+
   @Test fun aFixReportingVehicleSpeedIsLeftToTheSpeedCeiling() {
     val g = gate()
     g.walk(3)
@@ -627,6 +646,16 @@ class LocationGateTest {
     g.noteMotion(t0 + 25_000L)
     val out = g.eval(fix(300.0, 30.0, acc = 14.0, speed = 0.0), "n2")
     assertTrue("was $out", out is Outcome.Release)
+  }
+
+  // Oct 29, 07:05 (c21a1207, the walking starburst): 205 m in 71 s while both
+  // fixes reported 0.5 km/h, with motion vouched for. A small measured speed is
+  // still a pace, unlike the exact 0 of a network fix.
+  @Test fun aVouchedFixReportingASmallMeasuredSpeedIsStillHeldToIt() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 13.0, speed = 0.14), "w1")
+    g.noteMotion(t0 + 30_000L)
+    assertEquals(Outcome.Reject("inconsistent"), g.eval(fix(205.0, 71.0, acc = 13.0, speed = 0.14), "scatter"))
   }
 
   @Test fun anUnvouchedFixReportingZeroSpeedStillNeedsConfirmation() {

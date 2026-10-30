@@ -318,6 +318,20 @@ test("aFixReportingVehicleSpeedIsLeftToTheSpeedCeiling") {
   _ = walk(g, 3)
   check(released(g.eval(fix(340, 62, speed: 10), "bus")) != nil, "")
 }
+// Oct 30 15:55 (ff2b57e4): stop-and-go traffic reported a third of its real pace.
+test("stopAndGoTrafficIsNotMistakenForWalkingScatter") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0.6), "a0")
+  _ = g.eval(fix(63, 12, speed: 0.83), "a")
+  let out = g.eval(fix(232, 35, speed: 2.67), "b")
+  check(released(out) != nil, "\(out)")
+}
+test("briskWalkingKeepsTheTighterAllowance") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 1.9), "a0")
+  _ = g.eval(fix(63, 12, speed: 1.9), "a")
+  check(reject(g.eval(fix(232, 35, speed: 1.9), "b")) == "inconsistent", "")
+}
 test("walkingPaceFixesAgreeingOnANewPlaceAreAcceptedOnTheThird") {
   let g = gate()
   _ = walk(g, 3)
@@ -398,6 +412,13 @@ test("aVouchedFixReportingZeroSpeedIsNotHeldToThatPace") {
   g.noteMotion(t0 + 25_000)
   let out = g.eval(fix(300, 30, acc: 14, speed: 0), "n2")
   check(released(out) != nil, "\(out)")
+}
+// Oct 29 07:05 (the walking starburst): both fixes measured 0.5 km/h, a pace all the same.
+test("aVouchedFixReportingASmallMeasuredSpeedIsStillHeldToIt") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, acc: 13, speed: 0.14), "w1")
+  g.noteMotion(t0 + 30_000)
+  check(reject(g.eval(fix(205, 71, acc: 13, speed: 0.14), "scatter")) == "inconsistent", "")
 }
 test("anUnvouchedFixReportingZeroSpeedStillNeedsConfirmation") {
   let g = gate()
