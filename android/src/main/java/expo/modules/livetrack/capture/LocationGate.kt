@@ -1,6 +1,8 @@
 package expo.modules.livetrack.capture
 
+import kotlin.math.abs
 import kotlin.math.asin
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.pow
@@ -23,11 +25,16 @@ import kotlin.math.sqrt
  *  - (Oct 2026) A parked phone polled indoors gets fixes claiming speed 0 and
  *    ~10 m accuracy that land 300-1000 m away; every one passed the speed check
  *    and the map drew a starburst. Such jumps now need confirmation.
+ *  - (Oct 29) Walking, fixes reporting walking pace landed 77-600 m away: now
+ *    held to the distance their own speed explains.
+ *  - (Oct 30) A ride on network fixes only (no speed) looked like that scatter
+ *    for 30 minutes: far fixes heading steadily away now confirm as travel.
  *
  * Model: every accepted fix is HELD for one cycle so the next fix can vote on
  * whether it was a spur (zig-zag). The previously held fix is RELEASED when the
  * next one is accepted, so writes lag capture by one fix. [flush] releases the
- * held fix on demand (stop, still-transition).
+ * held fix on demand (stop); [flushAtStill] does so at the still transition
+ * unless the held fix may be a spur.
  *
  * @param T opaque payload the caller wants back when the fix is released
  *          (Android passes the fully-built row so metadata captured at arrival
@@ -64,7 +71,7 @@ class LocationGate<T>(
   )
 
   sealed class Outcome<out T> {
-    /** Dropped. `reason` is one of accuracy|stale|out-of-order|teleport|jitter|unconfirmed|zigzag. */
+    /** Dropped. `reason` is one of accuracy|stale|out-of-order|teleport|jitter|unconfirmed|inconsistent|zigzag. */
     data class Reject(val reason: String) : Outcome<Nothing>()
 
     /** Accepted and held for the zig-zag lookahead; nothing to write yet. */
@@ -110,6 +117,12 @@ class LocationGate<T>(
   private var cMonotonicT = 0L
   private var cCount = 0
 
+  /** A far fix on the candidate trail, with its distance and bearing from the anchor. */
+  private class TrailFix(val fix: Fix, val fromAnchorM: Double, val bearingDeg: Double)
+
+  /** The same far fixes, kept as a trail: a ride shows as fixes heading away together. */
+  private val trail = ArrayList<TrailFix>()
+
   /** Monotonic time of the last fix whose own speed proved motion; null = none yet. */
   private var lastMotionMonotonicT: Long? = null
 
@@ -154,7 +167,7 @@ class LocationGate<T>(
     }
 
     if (d < max(movingDistanceM, fix.acc) || isDrift(fix, a, d)) {
-      cCount = 0
+      resetCandidate()
       if (dt >= keepaliveMs) {
         // Still here after a keepalive interval: refresh the time base even when
         // nothing is written, so the speed check stays strict for a parked phone.
@@ -179,9 +192,58 @@ class LocationGate<T>(
     if (isUnconfirmedJump(fix, d)) {
       return if (confirmCandidate(fix)) accept(fix, payload, d) else Outcome.Reject("unconfirmed")
     }
-    cCount = 0
+    if (outrunsOwnSpeed(fix, a)) {
+      return if (confirmCandidate(fix)) accept(fix, payload, d) else Outcome.Reject("inconsistent")
+    }
+    resetCandidate()
 
     return accept(fix, payload, d)
+  }
+
+  /**
+   * A fix reporting walking pace that landed farther away than that pace (both
+   * fixes' accuracy included) can explain. Production (Oct 29): fixes reporting
+   * 1-4 km/h landed 77-600 m from a real walk, under the 126 km/h ceiling, and
+   * the map drew a starburst. A fix the last written point explains is a return
+   * from a held spur, which the zig-zag vote judges.
+   */
+  private fun outrunsOwnSpeed(fix: Fix, anchor: Fix): Boolean {
+    if (fix.speedMps == null) return false // no speed: the unconfirmed-jump check's case
+    if (paceExplains(fix, anchor, anchorMonotonicT)) return false
+    val e = emitted
+    return !(held != null && e != null && paceExplains(fix, e, e.monotonicT))
+  }
+
+  private fun paceExplains(fix: Fix, ref: Fix, refMonotonicT: Long): Boolean {
+    val dtS = (fix.monotonicT - refMonotonicT) / 1000.0
+    if (dtS <= 0.0 || dtS > PACE_CHECK_MAX_DT_S) return true // too long ago to say
+    val pace = max(fix.speedMps ?: 0.0, ref.speedMps ?: 0.0)
+    if (pace >= WALKING_PACE_MAX_MPS) return true // vehicle speeds: the speed ceiling judges
+    // Neither reports motion, yet motion is vouched for: no pace to judge by. Some
+    // phones' network fixes report 0 rather than no speed (c21a1207, Oct 30, in a
+    // vehicle), and were rejected here as if the phone had crawled.
+    if (pace < STILL_SPEED_MPS && !claimsStationary(fix)) return true
+    val d = haversineM(ref.lat, ref.lng, fix.lat, fix.lng)
+    return d <= max(UNCONFIRMED_MIN_JUMP_M, PACE_FACTOR * pace * dtS + fix.acc + ref.acc + PACE_MARGIN_M)
+  }
+
+  /**
+   * Far fixes rejected since the last one near the anchor seem to be heading
+   * away together: a ride rather than scatter. The service leaves still mode.
+   */
+  fun travelSuspected(): Boolean =
+    trail.size >= 2 && trail.last().fromAnchorM >= TRAVEL_SUSPECT_MIN_DISTANCE_M && headsAway(TRAVEL_NOISE_M)
+
+  /**
+   * Motion reported from outside the fixes, i.e. Activity Recognition saying
+   * IN_VEHICLE or ON_BICYCLE: speed-less fixes count as moving for
+   * [MOTION_MEMORY_MS] after it. Production (Oct 27-28): driving on network
+   * fixes only, every far one was rejected as unconfirmed while AR reported a
+   * vehicle. Walking is not enough; that is where the scatter was.
+   */
+  fun noteMotion(monotonicT: Long) {
+    val last = lastMotionMonotonicT
+    if (last == null || monotonicT > last) lastMotionMonotonicT = monotonicT
   }
 
   /**
@@ -206,10 +268,11 @@ class LocationGate<T>(
 
   /** No motion of its own (speed missing or ~0) and no recent fix that proved motion. */
   private fun claimsStationary(fix: Fix): Boolean {
-    val reportsNoMotion = fix.speedMps == null || fix.speedMps < STILL_SPEED_MPS
     val recentMotion = lastMotionMonotonicT?.let { fix.monotonicT - it <= MOTION_MEMORY_MS } ?: false
-    return reportsNoMotion && !recentMotion
+    return reportsNoMotion(fix) && !recentMotion
   }
+
+  private fun reportsNoMotion(fix: Fix): Boolean = fix.speedMps == null || fix.speedMps < STILL_SPEED_MPS
 
   /**
    * Parked points, one per [snapIntervalMs] so the newest point never says the
@@ -276,11 +339,57 @@ class LocationGate<T>(
       cCount = 1
     }
     cMonotonicT = fix.monotonicT
-    if (cCount >= REANCHOR_COUNT) {
-      cCount = 0
+    noteTrail(fix)
+    if (cCount >= REANCHOR_COUNT || isTravel()) {
+      resetCandidate()
       return true
     }
     return false
+  }
+
+  private fun resetCandidate() {
+    cCount = 0
+    trail.clear()
+  }
+
+  /**
+   * A ride: the trail heads away and is already farther out than indoor scatter
+   * reaches. Production (Oct 19-20 nights, c21a1207): scatter drifted outward
+   * along one bearing for 3-5 fixes up to ~900 m before snapping back; real
+   * rides (Oct 30) were 1.4-4 km out when the trail would have confirmed them.
+   */
+  private fun isTravel(): Boolean =
+    trail.size >= TRAVEL_MIN_FIXES && trail.last().fromAnchorM >= TRAVEL_MIN_DISTANCE_M &&
+      headsAway(TRAVEL_MIN_PROGRESS_M)
+
+  private fun noteTrail(fix: Fix) {
+    val a = anchor ?: return
+    trail += TrailFix(fix, haversineM(a.lat, a.lng, fix.lat, fix.lng), bearingDeg(a.lat, a.lng, fix.lat, fix.lng))
+    while (trail.size > TRAVEL_MAX_FIXES || fix.monotonicT - trail.first().fix.monotonicT > TRAVEL_WINDOW_MS) {
+      trail.removeAt(0)
+    }
+  }
+
+  /**
+   * The trail moves away from the anchor by at least [minProgressM], every fix
+   * on the bearing of the newest one, never falling back by more than GNSS-free
+   * noise, each step possible at the speed ceiling. Production (Oct 30): parked,
+   * then a 7.5 km ride on network fixes only, each landing farther along the road
+   * and each rejected for 30 minutes. Indoor scatter lands in every direction.
+   */
+  private fun headsAway(minProgressM: Double): Boolean {
+    val last = trail.last()
+    if (last.fromAnchorM - trail.first().fromAnchorM < minProgressM) return false
+    for (i in trail.indices) {
+      val p = trail[i]
+      if (angleBetweenDeg(p.bearingDeg, last.bearingDeg) > TRAVEL_BEARING_TOLERANCE_DEG) return false
+      if (i == 0) continue
+      val q = trail[i - 1]
+      if (p.fromAnchorM < q.fromAnchorM - TRAVEL_NOISE_M) return false
+      val dtS = max((p.fix.monotonicT - q.fix.monotonicT) / 1000.0, 1.0)
+      if (haversineM(q.fix.lat, q.fix.lng, p.fix.lat, p.fix.lng) > MAX_SPEED_MPS * dtS + q.fix.acc + p.fix.acc) return false
+    }
+    return true
   }
 
   /**
@@ -293,6 +402,23 @@ class LocationGate<T>(
     emitted = h.fix
     markOut(h.fix.lat, h.fix.lng, h.fix.monotonicT)
     return h.fix to h.payload
+  }
+
+  /**
+   * [flush] for the still transition, where the held fix is normally the last
+   * position before the stop. One far from the last written row that reports
+   * no motion may be a spur: production (Oct 26) wrote both spurs that reached
+   * the map this way, skipping the lookahead vote. It stays held so the next
+   * fixes decide: dropped if they come back near the start, written if they
+   * stay with it (the keepalive release) or carry on from it.
+   */
+  fun flushAtStill(): Pair<Fix, T>? {
+    val h = held ?: return null
+    val prev = emitted
+    if (prev != null && reportsNoMotion(h.fix) && haversineM(prev.lat, prev.lng, h.fix.lat, h.fix.lng) > ZIGZAG_LEG_M) {
+      return null
+    }
+    return flush()
   }
 
   private fun release(h: Held<T>, d: Double, atStop: Boolean = false): Outcome<T> {
@@ -326,10 +452,21 @@ class LocationGate<T>(
     return Outcome.Hold(d)
   }
 
-  private fun isZigZag(a: Fix, b: Fix, c: Fix): Boolean =
-    haversineM(a.lat, a.lng, b.lat, b.lng) > ZIGZAG_LEG_M &&
-      haversineM(b.lat, b.lng, c.lat, c.lng) > ZIGZAG_LEG_M &&
-      haversineM(a.lat, a.lng, c.lat, c.lng) < ZIGZAG_RETURN_M
+  private fun isZigZag(a: Fix, b: Fix, c: Fix): Boolean {
+    val ab = haversineM(a.lat, a.lng, b.lat, b.lng)
+    val bc = haversineM(b.lat, b.lng, c.lat, c.lng)
+    if (ab <= ZIGZAG_LEG_M || bc <= ZIGZAG_LEG_M) return false
+    return haversineM(a.lat, a.lng, c.lat, c.lng) < returnRadiusM(b, minOf(ab, bc))
+  }
+
+  /**
+   * How close C must come back to A for B to be a spur. A spur that reports no
+   * motion of its own may come back a share of its length away; production
+   * (Oct 26) had 1,388 m out and 44 m back, 486 m out and 50 m back. One that
+   * carries real speed keeps the fixed radius, so a genuine detour is kept.
+   */
+  private fun returnRadiusM(spur: Fix, shorterLegM: Double): Double =
+    if (reportsNoMotion(spur)) max(ZIGZAG_RETURN_M, ZIGZAG_RETURN_SHARE * shorterLegM) else ZIGZAG_RETURN_M
 
   companion object {
     /** Implied-speed ceiling. Field staff ride bikes and cars; 126 km/h is generous. */
@@ -379,6 +516,34 @@ class LocationGate<T>(
     /** ...while A→C stays within this. */
     const val ZIGZAG_RETURN_M = 40.0
 
+    /** ...or, for a spur reporting no motion, within this share of its shorter leg. */
+    const val ZIGZAG_RETURN_SHARE = 0.15
+
+    /** Below this reported speed (on foot) a fix must stay within what its pace explains... */
+    const val WALKING_PACE_MAX_MPS = 3.0
+    /** ...which is this many times that pace over the time since the reference fix... */
+    const val PACE_FACTOR = 2.0
+    /** ...plus both fixes' accuracy and this margin... */
+    const val PACE_MARGIN_M = 20.0
+    /** ...judged only this soon after the reference fix: an older one says little about pace. */
+    const val PACE_CHECK_MAX_DT_S = 180.0
+
+    /** Far fixes needed before a trail heading away counts as travel... */
+    const val TRAVEL_MIN_FIXES = 3
+    /** ...gaining at least this much distance from the anchor... */
+    const val TRAVEL_MIN_PROGRESS_M = 150.0
+    /** ...each never falling back by more than this... */
+    const val TRAVEL_NOISE_M = 25.0
+    /** ...each within this of the newest fix's bearing from the anchor... */
+    const val TRAVEL_BEARING_TOLERANCE_DEG = 45.0
+    /** ...within this window, at most this many fixes kept... */
+    const val TRAVEL_WINDOW_MS = 15 * 60_000L
+    const val TRAVEL_MAX_FIXES = 12
+    /** ...the newest beyond the reach of indoor scatter (seen up to ~900 m). */
+    const val TRAVEL_MIN_DISTANCE_M = 1_200.0
+    /** Far enough out for a trail to end still mode (scatter nights: ~2 such trails a night). */
+    const val TRAVEL_SUSPECT_MIN_DISTANCE_M = 500.0
+
     private const val EARTH_RADIUS_M = 6_371_000.0
 
     fun haversineM(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
@@ -387,6 +552,22 @@ class LocationGate<T>(
       val a = sin(dLat / 2).pow(2) +
         cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLng / 2).pow(2)
       return 2 * EARTH_RADIUS_M * asin(sqrt(a))
+    }
+
+    /** Initial bearing from the first point to the second, 0-360 degrees. */
+    fun bearingDeg(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+      val p1 = Math.toRadians(lat1)
+      val p2 = Math.toRadians(lat2)
+      val dLng = Math.toRadians(lng2 - lng1)
+      val y = sin(dLng) * cos(p2)
+      val x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dLng)
+      return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
+    }
+
+    /** Smallest angle between two bearings, 0-180 degrees. */
+    fun angleBetweenDeg(a: Double, b: Double): Double {
+      val d = abs(a - b) % 360.0
+      return if (d > 180.0) 360.0 - d else d
     }
   }
 }

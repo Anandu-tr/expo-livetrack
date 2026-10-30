@@ -226,6 +226,184 @@ test("realOutAndBackBeyondReturnRadiusIsKept") {
   _ = g.eval(fix(500, 20), "c")
   check(released(g.eval(fix(260, 30), "d"))?.payload == "c", "")
 }
+// Production, Oct 26 (c21a1207), as offsets; see the Android LocationGateTest.
+test("noSpeedSpurComingBackWithinAShareOfItsLengthIsDropped") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 4.4), "a0")
+  _ = g.eval(fix(100, 10, speed: 4.4), "a")
+  check(released(g.eval(fix(100, 28, speed: 0.3, dLngM: 486), "spur")) != nil, "a released, spur held")
+  let back = holdD(g.eval(fix(150, 58, speed: 0), "back"))
+  check(back != nil && abs(back! - 50) < 2, "the spur was written: \(String(describing: back))")
+  check(g.flush()?.1 == "back", "")
+}
+test("spurReportingMotionKeepsTheFortyMetreReturnRule") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 4.4), "a0")
+  _ = g.eval(fix(100, 10, speed: 4.4), "a")
+  _ = g.eval(fix(100, 28, speed: 5, dLngM: 486), "detour")
+  check(released(g.eval(fix(150, 58, speed: 5), "back"))?.payload == "detour", "")
+}
+
+// --- still transition ------------------------------------------------------------------
+
+test("stillTransitionHoldsAFarNoSpeedFixUntilTheNextFixesVote") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 4), "a0")
+  _ = g.eval(fix(64, 28, speed: 4), "a")
+  _ = g.eval(fix(64, 78, speed: 0, dLngM: 1_388), "spike")
+  check(g.flushAtStill() == nil, "the spike must wait for the next fixes")
+  check(reject(g.eval(fix(108, 270, speed: 0), "c1")) == "unconfirmed", "c1")
+  check(reject(g.eval(fix(104, 390, speed: 0), "c2")) == "unconfirmed", "c2")
+  check(holdD(g.eval(fix(106, 510, speed: 0), "c3")) != nil, "the spike must be dropped")
+  check(g.flush()?.1 == "c3", "")
+}
+test("stillTransitionThenReturnDropsADriveSpur") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 4.4), "a0")
+  _ = g.eval(fix(100, 10, speed: 4.4), "a")
+  _ = g.eval(fix(100, 28, speed: 0.3, dLngM: 486), "spike")
+  check(g.flushAtStill() == nil, "the spike must wait for the next fix")
+  check(holdD(g.eval(fix(150, 58, speed: 0), "back")) != nil, "the spike must be dropped")
+  check(g.flush()?.1 == "back", "")
+}
+test("heldFarJumpIsWrittenOnceTheNextFixesStayWithIt") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 4), "a0")
+  _ = g.eval(fix(64, 28, speed: 4), "a")
+  _ = g.eval(fix(64, 78, speed: 0, dLngM: 1_388), "new place")
+  check(g.flushAtStill() == nil, "")
+  check(released(g.eval(fix(68, 210, speed: 0, dLngM: 1_388), "there"))?.payload == "new place", "")
+}
+test("stillTransitionWritesTheLastPositionOfARealStop") {
+  let moving = gate()
+  _ = moving.eval(fix(0, 0, speed: 8), "a0")
+  _ = moving.eval(fix(150, 15, speed: 8), "a")
+  _ = moving.eval(fix(300, 30, speed: 3), "stop")
+  check(moving.flushAtStill()?.1 == "stop", "far but moving")
+  let stopped = gate()
+  _ = stopped.eval(fix(0, 0, speed: 8), "a0")
+  _ = stopped.eval(fix(150, 15, speed: 8), "a")
+  _ = stopped.eval(fix(210, 30, speed: 0), "stop")
+  check(stopped.flushAtStill()?.1 == "stop", "stopped close by")
+}
+test("stillTransitionWritesTheFirstHeldFixOfARun") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "first")
+  check(g.flushAtStill()?.1 == "first", "")
+}
+test("theOct26SpikeAtItsRealPaceIsStoppedAtTheGate") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0.55), "a0")
+  _ = g.eval(fix(64, 29, acc: 17.5, speed: 0.55), "a")
+  _ = g.eval(fix(69, 100, speed: 2.2), "vouch") // jitter, but it proves motion
+  check(reject(g.eval(fix(64, 138, acc: 12.4, speed: 0, dLngM: 1_388), "spike")) == "inconsistent", "")
+}
+
+// --- walking pace (Oct 29, c21a1207); see the Android LocationGateTest ----------------
+
+func walk(_ g: G, _ steps: Int) -> [G.Outcome] {
+  (0..<steps).map { i in g.eval(fix(20 * Double(i), 16 * Double(i), speed: 1.2), "w\(i)") }
+}
+test("walkingFixThatOutrunsItsOwnSpeedIsRejected") {
+  let g = gate()
+  _ = walk(g, 3)
+  check(reject(g.eval(fix(285, 81, acc: 6.5, speed: 1.1), "scatter")) == "inconsistent", "scatter")
+  check(released(g.eval(fix(60, 97, speed: 1.2), "w3"))?.payload == "w2", "the walk goes on")
+}
+test("walkingAtItsReportedPaceIsKept") {
+  check(walk(gate(), 12).dropFirst().allSatisfy { released($0) != nil }, "")
+}
+test("aFixReportingVehicleSpeedIsLeftToTheSpeedCeiling") {
+  let g = gate()
+  _ = walk(g, 3)
+  check(released(g.eval(fix(340, 62, speed: 10), "bus")) != nil, "")
+}
+test("walkingPaceFixesAgreeingOnANewPlaceAreAcceptedOnTheThird") {
+  let g = gate()
+  _ = walk(g, 3)
+  check(reject(g.eval(fix(285, 81, speed: 1.1), "x1")) == "inconsistent", "x1")
+  check(reject(g.eval(fix(290, 85, speed: 1.1), "x2")) == "inconsistent", "x2")
+  check(reject(g.eval(fix(288, 89, speed: 1.1), "x3")) == nil, "x3")
+}
+
+// --- travel without GPS (Oct 30, c21a1207) --------------------------------------------
+
+test("farFixesMovingSteadilyAwayAreAcceptedAsTravel") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "parked")
+  check(reject(g.eval(fix(230, 120, acc: 15, speed: nil, dLngM: 240), "r1")) == "unconfirmed", "r1")
+  check(reject(g.eval(fix(470, 240, acc: 15, speed: nil, dLngM: 450), "r2")) == "unconfirmed", "r2")
+  check(reject(g.eval(fix(700, 360, acc: 15, speed: nil, dLngM: 690), "r3")) == "unconfirmed", "980 m: not yet")
+  check(reject(g.eval(fix(930, 480, acc: 15, speed: nil, dLngM: 920), "r4")) == nil, "travel must be accepted")
+}
+test("scatterDriftingOutwardInOneDirectionIsNotTravel") {
+  // c21a1207's home, night of Oct 19-20, as offsets; see the Android LocationGateTest.
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "home")
+  // Fixes too far apart for the three-agree rule, so only a trail rule could take them.
+  let runs: [[(Double, Double, Double)]] = [
+    [(110, 220, 120), (114, 270, 136), (156, 407, 151)],
+    [(-480, 129, 600), (-588, 487, 628), (-698, 386, 648), (-799, 133, 666), (-886, 145, 685)],
+  ]
+  for run in runs {
+    for (n, e, t) in run {
+      check(reject(g.eval(fix(n, t, speed: 0, dLngM: e), "s")) != nil, "scatter at \(n),\(e)")
+    }
+    _ = g.eval(fix(3, run.last!.2 + 20, speed: 0), "home again")
+  }
+}
+test("aFixBackNearThePhoneBreaksTheTravelTrail") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "parked")
+  _ = g.eval(fix(230, 120, acc: 15, speed: nil, dLngM: 240), "r1")
+  _ = g.eval(fix(470, 240, acc: 15, speed: nil, dLngM: 450), "r2")
+  _ = g.eval(fix(3, 300, speed: 0), "home")
+  check(reject(g.eval(fix(700, 360, acc: 15, speed: nil, dLngM: 690), "r3")) == "unconfirmed", "r3")
+  check(reject(g.eval(fix(930, 480, acc: 15, speed: nil, dLngM: 920), "r4")) == "unconfirmed", "r4")
+}
+test("travelIsSuspectedOnceTwoFarFixesHeadTheSameWay") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "parked")
+  _ = g.eval(fix(230, 120, acc: 15, speed: nil, dLngM: 240), "r1")
+  check(!g.travelSuspected(), "one fix")
+  _ = g.eval(fix(470, 240, acc: 15, speed: nil, dLngM: 450), "r2")
+  check(g.travelSuspected(), "two fixes heading away")
+}
+test("scatterInDifferentDirectionsIsNotSuspectedTravel") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 0), "home")
+  _ = g.eval(fix(400, 30, speed: 0), "s0")
+  _ = g.eval(fix(-150, 75, speed: nil, dLngM: 600), "s1")
+  check(!g.travelSuspected(), "")
+}
+
+// --- a vehicle report from Activity Recognition (Oct 27-28) ---------------------------
+
+test("aVehicleReportVouchesForFixesWithoutSpeed") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 8), "p1")
+  g.noteMotion(t0 + 100_000)
+  check(released(g.eval(fix(400, 120, speed: nil), "p2")) != nil, "")
+}
+test("aVehicleReportVouchesForAMinuteOnly") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, speed: 8), "p1")
+  g.noteMotion(t0 + 10_000)
+  check(reject(g.eval(fix(400, 120, speed: nil), "p2")) == "unconfirmed", "")
+}
+// Network fixes reporting exactly 0 (c21a1207, Oct 30, in a vehicle): vouched for, no pace to hold them to.
+test("aVouchedFixReportingZeroSpeedIsNotHeldToThatPace") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, acc: 12, speed: 0), "n1")
+  g.noteMotion(t0 + 25_000)
+  let out = g.eval(fix(300, 30, acc: 14, speed: 0), "n2")
+  check(released(out) != nil, "\(out)")
+}
+test("anUnvouchedFixReportingZeroSpeedStillNeedsConfirmation") {
+  let g = gate()
+  _ = g.eval(fix(0, 0, acc: 12, speed: 0), "n1")
+  check(reject(g.eval(fix(300, 30, acc: 14, speed: 0), "n2")) == "unconfirmed", "")
+}
 
 // --- unconfirmed jumps (stationary scatter) ------------------------------------------
 

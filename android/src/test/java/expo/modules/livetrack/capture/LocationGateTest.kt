@@ -3,6 +3,7 @@ package expo.modules.livetrack.capture
 import expo.modules.livetrack.capture.LocationGate.Fix
 import expo.modules.livetrack.capture.LocationGate.Outcome
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -323,6 +324,116 @@ class LocationGateTest {
     assertEquals("c", (out as Outcome.Release).payload)
   }
 
+  // Production, Oct 26 (c21a1207), as offsets: a fix reporting about 1 km/h
+  // landed 486 m to the side of a slow drive and the next point came back 50 m
+  // from where it left. A long spur that reports no motion of its own may come
+  // back that far and still be a spur.
+  @Test fun noSpeedSpurComingBackWithinAShareOfItsLengthIsDropped() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 4.4), "a0")
+    g.eval(fix(100.0, 10.0, speed = 4.4), "a")
+    val spur = g.eval(fix(100.0, 28.0, speed = 0.3, dLngM = 486.0), "spur")
+    assertTrue(spur is Outcome.Release) // a released, the spur held
+    val back = g.eval(fix(150.0, 58.0, speed = 0.0), "back") // 50 m from a
+    assertTrue("the spur must not be written, was $back", back is Outcome.Hold)
+    assertEquals(50.0, (back as Outcome.Hold).displacementM, 2.0)
+    assertEquals("back", g.flush()!!.second)
+  }
+
+  @Test fun spurReportingMotionKeepsTheFortyMetreReturnRule() {
+    // Same shape, but the detour carries GNSS speed: a real out-and-back.
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 4.4), "a0")
+    g.eval(fix(100.0, 10.0, speed = 4.4), "a")
+    g.eval(fix(100.0, 28.0, speed = 5.0, dLngM = 486.0), "detour")
+    val out = g.eval(fix(150.0, 58.0, speed = 5.0), "back")
+    assertTrue(out is Outcome.Release)
+    assertEquals("detour", (out as Outcome.Release).payload)
+  }
+
+  // --- still transition ------------------------------------------------------
+  // Production, Oct 26 (c21a1207): both spurs that reached the map were the held
+  // fix, written by the flush when the phone went still, which skipped the vote.
+
+  @Test fun stillTransitionHoldsAFarNoSpeedFixUntilTheNextFixesVote() {
+    // 13:19, as offsets: a fix at speed 0 landed 1,388 m away just before the
+    // phone went still; the next fixes came back 42-44 m from the start. Here the
+    // fixes before it report vehicle speed, so the pace check leaves it to the
+    // vote (with the walking pace it really had, see the next test).
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 4.0), "a0")
+    g.eval(fix(64.0, 28.0, speed = 4.0), "a")
+    g.eval(fix(64.0, 78.0, speed = 0.0, dLngM = 1_388.0), "spike")
+    assertNull("the spike must wait for the next fixes", g.flushAtStill())
+    // Still mode: a fix every two minutes, back near the start, no speed.
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(108.0, 270.0, speed = 0.0), "c1"))
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(104.0, 390.0, speed = 0.0), "c2"))
+    val out = g.eval(fix(106.0, 510.0, speed = 0.0), "c3")
+    assertTrue("the spike must be dropped, was $out", out is Outcome.Hold)
+    assertEquals("c3", g.flush()!!.second)
+  }
+
+  @Test fun theOct26SpikeAtItsRealPaceIsStoppedAtTheGate() {
+    // 13:17:49 the phone reported 2 km/h; 109 s later a fix at speed 0 landed
+    // 1,388 m away. Something vouched for it as motion (a fix with speed in the
+    // minute before, modelled here), yet no pace explains it, so it never
+    // reaches the hold.
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.55), "a0")
+    g.eval(fix(64.0, 29.0, acc = 17.5, speed = 0.55), "a")
+    g.eval(fix(69.0, 100.0, speed = 2.2), "vouch") // jitter, but it proves motion
+    assertEquals(
+      Outcome.Reject("inconsistent"),
+      g.eval(fix(64.0, 138.0, acc = 12.4, speed = 0.0, dLngM = 1_388.0), "spike"),
+    )
+  }
+
+  @Test fun stillTransitionThenReturnDropsADriveSpur() {
+    // 13:59, as offsets: the 486 m spur was held when the phone went still and
+    // the first fix after it came back 50 m from the start.
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 4.4), "a0")
+    g.eval(fix(100.0, 10.0, speed = 4.4), "a")
+    g.eval(fix(100.0, 28.0, speed = 0.3, dLngM = 486.0), "spike")
+    assertNull("the spike must wait for the next fix", g.flushAtStill())
+    val out = g.eval(fix(150.0, 58.0, speed = 0.0), "back")
+    assertTrue("the spike must be dropped, was $out", out is Outcome.Hold)
+    assertEquals("back", g.flush()!!.second)
+  }
+
+  @Test fun heldFarJumpIsWrittenOnceTheNextFixesStayWithIt() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 4.0), "a0")
+    g.eval(fix(64.0, 28.0, speed = 4.0), "a")
+    g.eval(fix(64.0, 78.0, speed = 0.0, dLngM = 1_388.0), "new place")
+    assertNull(g.flushAtStill())
+    // Over two minutes later the phone is still there: the held fix was real.
+    val out = g.eval(fix(68.0, 210.0, speed = 0.0, dLngM = 1_388.0), "there")
+    assertTrue("was $out", out is Outcome.Release)
+    assertEquals("new place", (out as Outcome.Release).payload)
+  }
+
+  @Test fun stillTransitionWritesTheLastPositionOfARealStop() {
+    // Far but still moving when held: a real position.
+    val moving = gate()
+    moving.eval(fix(0.0, 0.0, speed = 8.0), "a0")
+    moving.eval(fix(150.0, 15.0, speed = 8.0), "a")
+    moving.eval(fix(300.0, 30.0, speed = 3.0), "stop")
+    assertEquals("stop", moving.flushAtStill()?.second)
+    // Stopped already, but close to the last written point.
+    val stopped = gate()
+    stopped.eval(fix(0.0, 0.0, speed = 8.0), "a0")
+    stopped.eval(fix(150.0, 15.0, speed = 8.0), "a")
+    stopped.eval(fix(210.0, 30.0, speed = 0.0), "stop")
+    assertEquals("stop", stopped.flushAtStill()?.second)
+  }
+
+  @Test fun stillTransitionWritesTheFirstHeldFixOfARun() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "first")
+    assertEquals("first", g.flushAtStill()?.second)
+  }
+
   // --- unconfirmed jumps (stationary scatter) -------------------------------
   // Production, Oct 2026: with Activity Recognition silent the service polled
   // every 10 s indoors and got fixes reporting speed 0 / no speed and 7-17 m
@@ -385,6 +496,143 @@ class LocationGateTest {
     // 60 m with 25 m accuracy: below max(75 m, 3 x acc) — an ordinary small move.
     val out = g.eval(fix(60.0, 30.0, acc = 25.0, speed = 0.0), "p2")
     assertTrue(out is Outcome.Release)
+  }
+
+  // --- walking pace (Oct 29, c21a1207) -------------------------------------
+  // Fixes reporting walking speed landed 77-600 m away from a real walk; the
+  // 126 km/h ceiling let them through and the map drew a starburst.
+
+  /** A walk: one fix every 16 s, 20 m apart, each reporting 1.2 m/s. */
+  private fun LocationGate<String>.walk(steps: Int): List<Outcome<String>> =
+    (0 until steps).map { i -> eval(fix(20.0 * i, 16.0 * i, speed = 1.2), "w$i") }
+
+  @Test fun walkingFixThatOutrunsItsOwnSpeedIsRejected() {
+    val g = gate()
+    g.walk(3) // w2 held at 40 m
+    // 07:38 shape: 245 m on in 49 s while reporting 4 km/h.
+    assertEquals(Outcome.Reject("inconsistent"), g.eval(fix(285.0, 81.0, acc = 6.5, speed = 1.1), "scatter"))
+    val next = g.eval(fix(60.0, 97.0, speed = 1.2), "w3") // the walk goes on
+    assertTrue(next is Outcome.Release)
+    assertEquals("w2", (next as Outcome.Release).payload)
+  }
+
+  @Test fun walkingAtItsReportedPaceIsKept() {
+    assertTrue(gate().walk(12).drop(1).all { it is Outcome.Release })
+  }
+
+  @Test fun aFixReportingVehicleSpeedIsLeftToTheSpeedCeiling() {
+    val g = gate()
+    g.walk(3)
+    // Boarded a bus: 300 m on in 30 s, reporting 10 m/s.
+    assertTrue(g.eval(fix(340.0, 62.0, speed = 10.0), "bus") is Outcome.Release)
+  }
+
+  @Test fun walkingPaceFixesAgreeingOnANewPlaceAreAcceptedOnTheThird() {
+    val g = gate()
+    g.walk(3)
+    assertEquals(Outcome.Reject("inconsistent"), g.eval(fix(285.0, 81.0, speed = 1.1), "x1"))
+    assertEquals(Outcome.Reject("inconsistent"), g.eval(fix(290.0, 85.0, speed = 1.1), "x2"))
+    assertTrue(g.eval(fix(288.0, 89.0, speed = 1.1), "x3") !is Outcome.Reject)
+  }
+
+  // --- travel without GPS (Oct 30, c21a1207) --------------------------------
+  // Parked, then a 7.5 km ride with network fixes only (no speed): each landed
+  // farther along the road and each was rejected as an unconfirmed jump, for
+  // 30 minutes.
+
+  @Test fun farFixesMovingSteadilyAwayAreAcceptedAsTravel() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "parked")
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(230.0, 120.0, acc = 15.0, speed = null, dLngM = 240.0), "r1"))
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(470.0, 240.0, acc = 15.0, speed = null, dLngM = 450.0), "r2"))
+    // 980 m out: indoor scatter reaches that far, so not yet.
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(700.0, 360.0, acc = 15.0, speed = null, dLngM = 690.0), "r3"))
+    val out = g.eval(fix(930.0, 480.0, acc = 15.0, speed = null, dLngM = 920.0), "r4") // 1.3 km
+    assertTrue("travel must be accepted, was $out", out !is Outcome.Reject)
+  }
+
+  @Test fun scatterDriftingOutwardInOneDirectionIsNotTravel() {
+    // c21a1207's home, night of Oct 19-20 (old build, polled every 15 s), as
+    // offsets from home: the scatter drifted away along one bearing for several
+    // fixes before snapping back, which a trail rule without a distance floor
+    // took for a ride.
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "home")
+    // Fixes too far apart for the three-agree rule, so only a trail rule could take them.
+    val runs = listOf(
+      listOf(Triple(110.0, 220.0, 120.0), Triple(114.0, 270.0, 136.0), Triple(156.0, 407.0, 151.0)), // 247 -> 292 -> 436 m
+      listOf(Triple(-480.0, 129.0, 600.0), Triple(-588.0, 487.0, 628.0), Triple(-698.0, 386.0, 648.0), Triple(-799.0, 133.0, 666.0), Triple(-886.0, 145.0, 685.0)), // 497 -> 898 m
+    )
+    for (run in runs) {
+      for ((n, e, t) in run) {
+        val out = g.eval(fix(n, t, speed = 0.0, dLngM = e), "s")
+        assertTrue("scatter at $n,$e must be rejected, was $out", out is Outcome.Reject)
+      }
+      g.eval(fix(3.0, run.last().third + 20.0, speed = 0.0), "home again") // snaps back
+    }
+  }
+
+  @Test fun aFixBackNearThePhoneBreaksTheTravelTrail() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "parked")
+    g.eval(fix(230.0, 120.0, acc = 15.0, speed = null, dLngM = 240.0), "r1")
+    g.eval(fix(470.0, 240.0, acc = 15.0, speed = null, dLngM = 450.0), "r2")
+    g.eval(fix(3.0, 300.0, speed = 0.0), "home") // indoor scatter, not a ride
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(700.0, 360.0, acc = 15.0, speed = null, dLngM = 690.0), "r3"))
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(930.0, 480.0, acc = 15.0, speed = null, dLngM = 920.0), "r4"))
+  }
+
+  @Test fun travelIsSuspectedOnceTwoFarFixesHeadTheSameWay() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "parked")
+    g.eval(fix(230.0, 120.0, acc = 15.0, speed = null, dLngM = 240.0), "r1")
+    assertFalse(g.travelSuspected())
+    g.eval(fix(470.0, 240.0, acc = 15.0, speed = null, dLngM = 450.0), "r2")
+    assertTrue(g.travelSuspected())
+  }
+
+  @Test fun scatterInDifferentDirectionsIsNotSuspectedTravel() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 0.0), "home")
+    g.eval(fix(400.0, 30.0, speed = 0.0), "s0")
+    g.eval(fix(-150.0, 75.0, speed = null, dLngM = 600.0), "s1")
+    assertFalse(g.travelSuspected())
+  }
+
+  // --- a vehicle report from Activity Recognition ---------------------------
+  // Oct 27-28 (c21a1207): driving on network fixes only, 14-28 fixes per
+  // 10 min rejected as unconfirmed jumps while AR reported a vehicle.
+
+  @Test fun aVehicleReportVouchesForFixesWithoutSpeed() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 8.0), "p1")
+    g.noteMotion(t0 + 100_000L)
+    val out = g.eval(fix(400.0, 120.0, speed = null), "p2")
+    assertTrue("was $out", out is Outcome.Release)
+  }
+
+  @Test fun aVehicleReportVouchesForAMinuteOnly() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, speed = 8.0), "p1")
+    g.noteMotion(t0 + 10_000L)
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(400.0, 120.0, speed = null), "p2"))
+  }
+
+  // c21a1207's network fixes report a speed of exactly 0 rather than none
+  // (Oct 30, 10:51-10:52, in a vehicle). Vouched for, that 0 is no pace at all;
+  // the walking-pace check rejected them as if the phone had crawled.
+  @Test fun aVouchedFixReportingZeroSpeedIsNotHeldToThatPace() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 12.0, speed = 0.0), "n1")
+    g.noteMotion(t0 + 25_000L)
+    val out = g.eval(fix(300.0, 30.0, acc = 14.0, speed = 0.0), "n2")
+    assertTrue("was $out", out is Outcome.Release)
+  }
+
+  @Test fun anUnvouchedFixReportingZeroSpeedStillNeedsConfirmation() {
+    val g = gate()
+    g.eval(fix(0.0, 0.0, acc = 12.0, speed = 0.0), "n1")
+    assertEquals(Outcome.Reject("unconfirmed"), g.eval(fix(300.0, 30.0, acc = 14.0, speed = 0.0), "n2"))
   }
 
   // --- displacement reporting for still-mode exit --------------------------

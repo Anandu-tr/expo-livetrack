@@ -12,6 +12,8 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.TriggerEvent
 import android.hardware.TriggerEventListener
@@ -25,6 +27,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -49,6 +52,9 @@ import expo.modules.livetrack.buffer.PointEntity
 import expo.modules.livetrack.capture.FastCadence
 import expo.modules.livetrack.capture.GateStats
 import expo.modules.livetrack.capture.LocationGate
+import expo.modules.livetrack.capture.MotionCheck
+import expo.modules.livetrack.capture.RejectLog
+import expo.modules.livetrack.capture.StillBySpeed
 import expo.modules.livetrack.capture.TurnSampler
 import expo.modules.livetrack.keepalive.KillStats
 import expo.modules.livetrack.keepalive.ProcessExits
@@ -155,6 +161,7 @@ class TrackingService : Service() {
       // assumes single-threaded main-looper access with no synchronization,
       // so make that explicit rather than relying on an unenforced inference.
       graceHandler.post {
+        stats.sigMotion()
         // Self-disarmed by the OS already; the isStill check makes this a
         // no-op if we left still mode through another path in the meantime.
         if (isStill) {
@@ -163,9 +170,78 @@ class TrackingService : Service() {
           // exiting so the next captured fix isn't mislabeled "STILL" while
           // actually moving again — speedActivity() takes over until AR corrects it.
           currentActivity = "UNKNOWN"
-          onExitStill()
+          onExitStill(EXIT_SIG_MOTION)
         }
       }
+    }
+  }
+
+  private val hasSignificantMotion: Boolean by lazy {
+    sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION) != null
+  }
+
+  // --- Accelerometer motion checks -----------------------------------------
+  // The fallback when the signals above fail. Production (Oct 29-30): AR silent
+  // for up to 226 min or reading a ride as STILL, no significant-motion trigger,
+  // and up to 30 min of riding in still mode. A [MotionCheck] samples the
+  // accelerometer for a few seconds, screen off only (in the hand, shaking says
+  // nothing about travel): in still mode to leave it, and while fixes don't
+  // prove motion to keep out of it.
+  private val accelerometer: Sensor? by lazy { sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) }
+  private val motion = MotionCheck()
+  private var motionWakeLock: PowerManager.WakeLock? = null
+  private val motionListener = object : SensorEventListener {
+    override fun onSensorChanged(event: SensorEvent) {
+      motion.sample(event.values[0], event.values[1], event.values[2])
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+  }
+  private val motionDone = Runnable { finishMotionCheck() }
+
+  /** Start a motion check if one is due. Readings arrive on the main looper. */
+  private fun maybeCheckMotion() {
+    val now = SystemClock.elapsedRealtime()
+    if (!isRunning || !motion.due(now)) return
+    val sensor = accelerometer ?: return
+    val power = getSystemService(PowerManager::class.java) ?: return
+    if (power.isInteractive) return
+    motion.start(now)
+    // Only for the sample window: the CPU would otherwise sleep through it.
+    motionWakeLock = runCatching {
+      power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "livetrack:motion").apply {
+        acquire(MotionCheck.SAMPLE_MS + 2_000L)
+      }
+    }.getOrNull()
+    val listening = runCatching {
+      sensorManager?.registerListener(motionListener, sensor, SensorManager.SENSOR_DELAY_GAME, maintenanceHandler) == true
+    }.getOrDefault(false)
+    if (!listening) {
+      endMotionCheck()
+      return
+    }
+    maintenanceHandler.postDelayed(motionDone, MotionCheck.SAMPLE_MS)
+  }
+
+  /** Stop listening and release the wake lock; the verdict, if one could be made. */
+  private fun endMotionCheck(): MotionCheck.Verdict? {
+    maintenanceHandler.removeCallbacks(motionDone)
+    runCatching { sensorManager?.unregisterListener(motionListener) }
+    motionWakeLock?.let { lock -> runCatching { if (lock.isHeld) lock.release() } }
+    motionWakeLock = null
+    return motion.finish(SystemClock.elapsedRealtime())
+  }
+
+  private fun finishMotionCheck() {
+    val verdict = endMotionCheck() ?: return
+    stats.motion(verdict.std, verdict.moving)
+    if (!verdict.moving) return
+    // Being carried or ridden: no still decision now (recentlyMoving() holds AR's
+    // STILL off for a while), and out of still mode if in it.
+    stillBySpeed.reset()
+    if (isStill) {
+      currentActivity = "UNKNOWN"
+      onExitStill(EXIT_MOTION)
     }
   }
 
@@ -186,10 +262,12 @@ class TrackingService : Service() {
   private var startedAt = 0L
   private var lastArResultAt = 0L
   private var lastArReregisterAt = 0L
-  /** Start of the current run of fixes reporting speed < STILL_SPEED_MPS; 0 = none. */
-  private var lowSpeedSince = 0L
-  /** Last fix that reported real motion; vetoes an AR "STILL" right after it. */
+  /** The still decision from speed while AR is silent. */
+  private val stillBySpeed = StillBySpeed()
+  /** Last fix that reported (or, by its displacement, proved) real motion; vetoes an AR "STILL" right after it. */
   private var lastMovingFixAt = 0L
+  /** Monotonic time of the last fix the gate accepted; 0 = none yet. */
+  private var lastAcceptedFixAt = 0L
   /** What put us in still mode: AR, or the speed fallback while AR is silent. */
   private var stillSource = STILL_SOURCE_AR
 
@@ -206,6 +284,8 @@ class TrackingService : Service() {
 
   // --- Periodic maintenance + STATS heartbeat ------------------------------
   private val stats = GateStats()
+  /** Which rejected fixes go up as REJ rows; reset with each STATS window. */
+  private val rejectLog = RejectLog()
   private var lastStatsAt = 0L
   private val maintenanceHandler = Handler(Looper.getMainLooper())
   private val maintenanceTick = object : Runnable {
@@ -304,6 +384,7 @@ class TrackingService : Service() {
       lastArResultAt = 0L
       lastArReregisterAt = 0L
       stats.reset()
+      rejectLog.reset()
     }
     isRunning = true
 
@@ -449,6 +530,7 @@ class TrackingService : Service() {
     graceHandler.removeCallbacks(graceTick)
     maintenanceHandler.removeCallbacks(maintenanceTick)
     cancelProbe()
+    endMotionCheck()
     disarmSignificantMotion()
     runCatching { fused.removeLocationUpdates(locationCallback) }
     // Keep AR registered if we're supposed to still be tracking: an unexpected
@@ -637,7 +719,9 @@ class TrackingService : Service() {
       loc.latitude, loc.longitude, acc, loc.time, loc.elapsedRealtimeNanos / 1_000_000L, reportedSpeed,
     )
     stats.delivered()
-    noteReportedSpeed(acc, reportedSpeed, ageMs)
+    // A fix that doesn't prove motion leaves it to the accelerometer whether the
+    // phone is moving; every delivery in still mode is a chance to notice a ride.
+    if (isStill || reportedSpeed == null || reportedSpeed < LocationGate.MOTION_SPEED_MPS) maybeCheckMotion()
 
     val battery = readBattery()
     val mock = isMock(loc)
@@ -666,11 +750,18 @@ class TrackingService : Service() {
       eventType = null,
     )
 
-    when (val out = g.evaluate(fix, ageMs, point)) {
+    val out = g.evaluate(fix, ageMs, point)
+    val farReject = out is LocationGate.Outcome.Reject && out.reason in FAR_REJECTS
+    noteReportedSpeed(acc, reportedSpeed, ageMs, farReject)
+
+    when (out) {
       is LocationGate.Outcome.Reject -> {
         Log.d(TAG, "gate reject=${out.reason} acc=$acc age=${ageMs}ms t=${loc.time}")
         stats.reject(out.reason)
-        if (isStill && out.reason in PROBE_HINT_REASONS && isFarFromLastAccepted(loc, acc)) {
+        logReject(out.reason, loc, acc, reportedSpeed)
+        if (farReject && g.travelSuspected()) {
+          onTravelSuspected()
+        } else if (isStill && out.reason in PROBE_HINT_REASONS && isFarFromLastAccepted(loc, acc)) {
           maybeProbe(hint = true)
         }
       }
@@ -699,14 +790,53 @@ class TrackingService : Service() {
   /**
    * Speed bookkeeping for usable fixes (current, accurate enough): feeds the
    * AR-silence still fallback and the veto on AR "STILL" while driving. Fixes
-   * that report no speed say nothing either way.
+   * that report no speed say nothing either way; [far] ones the gate rejected
+   * for landing far away don't count as standing still.
    */
-  private fun noteReportedSpeed(acc: Double, speed: Double?, ageMs: Long) {
+  private fun noteReportedSpeed(acc: Double, speed: Double?, ageMs: Long, far: Boolean) {
     if (speed == null || acc < 0.0 || acc > maxAccuracyM || ageMs > LocationGate.MAX_FIX_AGE_MS) return
     val now = SystemClock.elapsedRealtime()
-    if (speed >= LocationGate.STILL_SPEED_MPS) lowSpeedSince = 0L else if (lowSpeedSince == 0L) lowSpeedSince = now
+    stillBySpeed.onSpeed(speed, now, far)
     if (speed >= LocationGate.MOTION_SPEED_MPS) lastMovingFixAt = now
     if (fast.onSpeed(speed, now, isStill) && isRunning) restartLocationUpdates()
+  }
+
+  /**
+   * Far fixes heading away together (the gate's travelSuspected): a ride the
+   * fixes can't prove yet, network fixes without speed. Leave still mode for the
+   * moving cadence, which keeps GNSS asked for continuously (a 30 s probe got
+   * none in a 30 min ride on Oct 30; GNSS came back 3 min into moving mode), and
+   * keep the speed fallback and AR's STILL from putting the phone back.
+   */
+  private fun onTravelSuspected() {
+    lastMovingFixAt = SystemClock.elapsedRealtime()
+    stillBySpeed.reset()
+    if (isStill) {
+      currentActivity = "UNKNOWN"
+      onExitStill(EXIT_TRAVEL)
+    }
+  }
+
+  /** A REJ row for the rejects [RejectLog] keeps, so field data shows what the gate threw away. */
+  private fun logReject(reason: String, loc: Location, acc: Double, speed: Double?) {
+    if (!lifecycleEventsOn) return
+    val r = rejectLog.take(reason, isStill, loc.latitude, loc.longitude, acc, speed) ?: return
+    // l/g stay the last accepted position, like every other row: the rejected
+    // position is only in `r`, so nothing reads it as where the phone was.
+    val row = PointEntity(
+      userId = userId,
+      t = loc.time,
+      lat = lastLat,
+      lng = lastLng,
+      batt = readBattery().first,
+      act = r,
+      eventType = "HEARTBEAT",
+    )
+    scope.launch {
+      runCatching { dao.insert(row) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(reject) failed", mapOf("hasLocation" to "false"))
+      }
+    }
   }
 
   /** A rejected fix that still says "you've moved": far beyond its own accuracy. */
@@ -722,6 +852,20 @@ class TrackingService : Service() {
     lastLat = loc.latitude
     lastLng = loc.longitude
     TrackedPosition.latLng = loc.latitude to loc.longitude
+    // Network fixes in a vehicle often carry no speed: their displacement is the
+    // only sign of the ride, for the speed fallback and the AR "STILL" veto alike.
+    val fixAt = loc.elapsedRealtimeNanos / 1_000_000L
+    val now = SystemClock.elapsedRealtime()
+    if (lastAcceptedFixAt != 0L) {
+      val dtMs = fixAt - lastAcceptedFixAt
+      stillBySpeed.onMove(displacementM, dtMs, now)
+      if (dtMs > 0L && displacementM >= StillBySpeed.MOVE_MIN_M &&
+        displacementM / (dtMs / 1000.0) >= LocationGate.MOTION_SPEED_MPS
+      ) {
+        lastMovingFixAt = now
+      }
+    }
+    lastAcceptedFixAt = fixAt
     // Activity Recognition can sit in STILL for an entire ride (observed: 120 s
     // cadence over 9 km, with gaps of up to an hour). Real displacement is the
     // ground truth, so leave still mode from here instead of waiting for AR.
@@ -730,7 +874,7 @@ class TrackingService : Service() {
         (loc.hasSpeed() && loc.speed > STILL_EXIT_SPEED_MPS))
     ) {
       currentActivity = speedActivity(loc).takeIf { it != "STILL" } ?: "UNKNOWN"
-      onExitStill()
+      onExitStill(EXIT_FIX)
     }
   }
 
@@ -759,10 +903,12 @@ class TrackingService : Service() {
   /**
    * Release the fix the gate is holding for its lookahead. Called on the still
    * transition (so the last real position is written before the keepalives
-   * start) and on destroy, where the insert must complete synchronously.
+   * start; [atStill] lets the gate keep a possible spur for the next fixes to
+   * judge) and on destroy, where the insert must complete synchronously.
    */
-  private fun flushGate(blocking: Boolean = false) {
-    val (_, payload) = gate?.flush() ?: return
+  private fun flushGate(blocking: Boolean = false, atStill: Boolean = false) {
+    val g = gate ?: return
+    val (_, payload) = (if (atStill) g.flushAtStill() else g.flush()) ?: return
     if (blocking) {
       runCatching { runBlocking(Dispatchers.IO) { dao.insert(payload) } }
     } else {
@@ -914,11 +1060,14 @@ class TrackingService : Service() {
 
   /**
    * AR misreads smooth driving as STILL; a fix that just reported real speed
-   * outranks it. The grace period would exit again anyway, but only after
-   * churning the location request and painting a heartbeat mid-drive.
+   * outranks it, as does a recent accelerometer check that found the phone
+   * moving. The grace period would exit again anyway, but only after churning
+   * the location request and painting a heartbeat mid-drive.
    */
-  private fun recentlyMoving(): Boolean =
-    lastMovingFixAt != 0L && SystemClock.elapsedRealtime() - lastMovingFixAt < AR_STILL_VETO_MS
+  private fun recentlyMoving(): Boolean {
+    val now = SystemClock.elapsedRealtime()
+    return (lastMovingFixAt != 0L && now - lastMovingFixAt < AR_STILL_VETO_MS) || motion.movingRecently(now)
+  }
 
   private fun handleActivityTransition(intent: Intent) {
     try {
@@ -929,12 +1078,13 @@ class TrackingService : Service() {
         val entering = event.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
         when (event.activityType) {
           DetectedActivity.STILL -> {
-            if (!entering) onExitStill() else if (!recentlyMoving()) onEnterStill(STILL_SOURCE_AR)
+            if (!entering) onExitStill(EXIT_AR) else if (!recentlyMoving()) onEnterStill(STILL_SOURCE_AR)
           }
           else -> {
             if (entering) {
               currentActivity = activityName(event.activityType)
-              if (isStill) onExitStill()
+              if (isVehicle(event.activityType)) gate?.noteMotion(SystemClock.elapsedRealtime())
+              if (isStill) onExitStill(EXIT_AR)
             }
           }
         }
@@ -963,13 +1113,21 @@ class TrackingService : Service() {
         }
         else -> {
           currentActivity = activityName(mostProbable.type)
-          if (isStill) onExitStill()
+          if (isVehicle(mostProbable.type)) gate?.noteMotion(SystemClock.elapsedRealtime())
+          if (isStill) onExitStill(EXIT_AR)
         }
       }
     } catch (e: Exception) {
       // ignore malformed sample payloads
     }
   }
+
+  /**
+   * AR in a vehicle or on a bicycle vouches for fixes without speed (network
+   * fixes mid-ride) in the gate. Walking does not: that is where scatter was.
+   */
+  private fun isVehicle(type: Int): Boolean =
+    type == DetectedActivity.IN_VEHICLE || type == DetectedActivity.ON_BICYCLE
 
   /** @param source [STILL_SOURCE_AR], or [STILL_SOURCE_NOAR] from the speed fallback. */
   private fun onEnterStill(source: String) {
@@ -987,7 +1145,8 @@ class TrackingService : Service() {
     nextProbeAt = SystemClock.elapsedRealtime() + PROBE_FIRST_DELAY_MS
     // Write the fix the gate is holding first: it is the last real position
     // before the stationary period, and nothing else would release it in time.
-    flushGate()
+    // A far fix with no speed of its own stays held for the next fixes to judge.
+    flushGate(atStill = true)
     // Grace period: keep the current (moving) cadence running for
     // STILL_GRACE_MS instead of switching to stillIntervalMs immediately, so a
     // stop-then-immediately-go-again is fully covered at full resolution and
@@ -1001,10 +1160,11 @@ class TrackingService : Service() {
     heartbeatHandler.postDelayed(heartbeatTick, stillIntervalMs)
   }
 
-  private fun onExitStill() {
+  /** @param cause what ended still mode, for the `MOVING|cause` row: one of the EXIT_* values. */
+  private fun onExitStill(cause: String) {
     if (!isStill) return
     isStill = false
-    lowSpeedSince = 0L
+    stillBySpeed.reset()
     nextProbeAt = 0L
     probeConfirms = 0
     cancelProbe()
@@ -1014,6 +1174,31 @@ class TrackingService : Service() {
     // A fast fix may be what ended still mode: go straight to the fast cadence.
     fast.update(SystemClock.elapsedRealtime(), still = false)
     restartLocationUpdates() // restore the moving cadence
+    bufferMoveEvent(cause)
+  }
+
+  /**
+   * HEARTBEAT row with `r` = `MOVING|<cause>` when still mode ends, so field data
+   * times every still period from both ends and says what ended it (only its
+   * start was recorded before). Opt-in with the lifecycle diagnostics.
+   */
+  private fun bufferMoveEvent(cause: String) {
+    if (!lifecycleEventsOn) return
+    val row = PointEntity(
+      userId = userId,
+      t = System.currentTimeMillis(),
+      lat = lastLat,
+      lng = lastLng,
+      batt = readBattery().first,
+      act = "MOVING|$cause",
+      eventType = "HEARTBEAT",
+    )
+    scope.launch {
+      runCatching { dao.insert(row) }.onFailure {
+        reporter.recordFailure("db-write", it.message ?: "insert(moving) failed", mapOf("hasLocation" to "false"))
+      }
+    }
+    runCatching { expo.modules.livetrack.sync.UploadWorker.enqueue(applicationContext) }
   }
 
   /**
@@ -1071,10 +1256,14 @@ class TrackingService : Service() {
     }
     // Without AR, nothing else would ever enter still mode: a parked phone keeps
     // polling every movingIntervalMs indoors, which is where the scatter comes from.
-    if (arSilent && !isStill && lowSpeedSince != 0L && now - lowSpeedSince >= STILL_BY_SPEED_MS) {
+    // Not while the accelerometer says the phone is being carried or ridden.
+    if (arSilent && !isStill && stillBySpeed.due(now) && !recentlyMoving()) {
       onEnterStill(STILL_SOURCE_NOAR)
     }
-    if (isStill) maybeProbe(hint = false)
+    if (isStill) {
+      maybeCheckMotion()
+      maybeProbe(hint = false)
+    }
     // Back to movingIntervalMs once no fix has been fast for a while (with the
     // distance floor, a stopped phone gets no deliveries to notice it from).
     if (fast.update(now, isStill) && isRunning && !isStill) restartLocationUpdates()
@@ -1085,13 +1274,15 @@ class TrackingService : Service() {
    * Start a probe if one is due. Scheduled probes back off while they keep
    * finding the phone still; hint probes (a rejected fix far from the last
    * position) come sooner but with a gap that grows the same way, so a parked
-   * phone's scatter can't keep GNSS busy.
+   * phone's scatter can't keep GNSS busy. Rejected fixes heading away together
+   * end still mode instead (see onTravelSuspected).
    */
   private fun maybeProbe(hint: Boolean) {
     if (!isStill || !isRunning || probe != null) return
     val now = SystemClock.elapsedRealtime()
     val due = if (hint) {
-      now - lastProbeAt >= minOf(PROBE_HINT_MIN_GAP_MS shl probeConfirms.coerceAtMost(8), PROBE_MAX_INTERVAL_MS)
+      val gap = minOf(PROBE_HINT_MIN_GAP_MS shl probeConfirms.coerceAtMost(8), PROBE_MAX_INTERVAL_MS)
+      now - lastProbeAt >= gap
     } else {
       nextProbeAt != 0L && now >= nextProbeAt
     }
@@ -1145,10 +1336,11 @@ class TrackingService : Service() {
       lat = lastLat,
       lng = lastLng,
       batt = readBattery().first,
-      act = stats.format(isStill, arAgeMin),
+      act = stats.format(isStill, arAgeMin, hasSignificantMotion),
       eventType = "HEARTBEAT",
     )
     stats.reset()
+    rejectLog.reset()
     scope.launch {
       runCatching { dao.insert(row) }.onFailure {
         reporter.recordFailure("db-write", it.message ?: "insert(stats) failed", mapOf("hasLocation" to "false"))
@@ -1205,12 +1397,24 @@ class TrackingService : Service() {
     private const val STILL_SOURCE_AR = "STILL"
     private const val STILL_SOURCE_NOAR = "STILL_NOAR"
 
+    // `MOVING|<cause>` row values: what ended still mode. Activity Recognition,
+    // the significant-motion trigger, an accepted fix that moved or reported
+    // speed (probe fixes included), an accelerometer check, rejected fixes
+    // heading away together.
+    private const val EXIT_AR = "ar"
+    private const val EXIT_SIG_MOTION = "sm"
+    private const val EXIT_FIX = "fix"
+    private const val EXIT_MOTION = "motion"
+    private const val EXIT_TRAVEL = "travel"
+
+    // Gate rejections for landing far from the last position (the travel trail's input).
+    private val FAR_REJECTS = setOf("teleport", "unconfirmed", "inconsistent")
+
     // AR samples are requested every 10 s; 15 min without a single result means
     // it has stopped delivering (seen for 1-2 days at a time on POCO phones).
     private const val AR_SILENCE_MS = 15 * 60_000L
     private const val AR_REREGISTER_INTERVAL_MS = 30 * 60_000L
-    // With AR silent, this long of fixes reporting ~0 speed counts as still.
-    private const val STILL_BY_SPEED_MS = 3 * 60_000L
+    // With AR silent, StillBySpeed.RUN_MS of fixes reporting ~0 speed counts as still.
     // An AR "STILL" this soon after a fix reported real speed is ignored.
     private const val AR_STILL_VETO_MS = 30_000L
 
@@ -1224,7 +1428,7 @@ class TrackingService : Service() {
     private const val PROBE_HINT_MIN_GAP_MS = 2 * 60_000L
     // A rejected fix this far beyond its own accuracy from the last position.
     private const val PROBE_HINT_MARGIN_M = 150.0
-    private val PROBE_HINT_REASONS = setOf("accuracy", "teleport", "unconfirmed")
+    private val PROBE_HINT_REASONS = setOf("accuracy", "teleport", "unconfirmed", "inconsistent")
 
     private const val MAINTENANCE_TICK_MS = 60_000L
     private const val STATS_INTERVAL_MS = 10 * 60_000L

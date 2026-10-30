@@ -16,6 +16,8 @@
   <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
   <!-- Internet on/off events (NET_OFF / NET_ON heartbeats). Normal permission, no prompt. -->
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <!-- Keeps the CPU awake for a 3 s accelerometer motion check. Normal permission, no prompt. -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
 
   <application>
     <!--
